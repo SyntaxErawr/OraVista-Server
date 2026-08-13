@@ -546,6 +546,55 @@ app.put('/api/update-appointment-status', async (req, res) => {
     }
 });
 
+// Staff billing: retrieve appointments with the patient details needed for billing.
+app.get('/api/staff/billings', async (req, res) => {
+    try {
+        const { rows } = await db.query(`
+            SELECT a.*, u.first_name, u.last_name, u.age, u.sex, u.email
+            FROM appointments a
+            JOIN users u ON u.id = a.user_id
+            WHERE a.status IN ('Approved', 'Confirmed', 'Completed')
+            ORDER BY a.appointment_date DESC, a.id DESC
+        `);
+        res.status(200).json(rows);
+    } catch (err) {
+        console.error('Staff billing fetch error:', err);
+        res.status(500).json({ message: 'Failed to fetch billing records.' });
+    }
+});
+
+// Staff billing: save receipt customisation and publish the billing status to the patient.
+app.put('/api/staff/billings/:appointmentId', async (req, res) => {
+    const { appointmentId } = req.params;
+    const { billing_status, amount, service_type, receipt_details } = req.body;
+    const allowedStatuses = ['Pending', 'Approved', 'Denied', 'Paid'];
+
+    if (!allowedStatuses.includes(billing_status)) {
+        return res.status(400).json({ message: 'Invalid billing status.' });
+    }
+
+    try {
+        const { rows } = await db.query(
+            `UPDATE appointments
+             SET billing_status = $1,
+                 amount = $2,
+                 service_type = $3,
+                 receipt_details = $4::jsonb
+             WHERE id = $5
+             RETURNING *`,
+            [billing_status, Number(amount) || 0, service_type, JSON.stringify(receipt_details || {}), appointmentId]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ message: 'Appointment not found.' });
+        }
+        res.status(200).json({ message: `Billing marked as ${billing_status}.`, appointment: rows[0] });
+    } catch (err) {
+        console.error('Staff billing update error:', err);
+        res.status(500).json({ message: 'Failed to update billing record.' });
+    }
+});
+
 app.get('/api/appointments/check-availability', async (req, res) => {
     const { date, dentist } = req.query;
     try {
