@@ -226,6 +226,13 @@ app.post('/api/login', async (req, res) => {
                 firstName: user.first_name,
                 lastName: user.last_name,
                 email: user.email,
+                sex: user.sex ?? "",
+                dob: user.dob instanceof Date
+                    ? `${user.dob.getFullYear()}-${String(user.dob.getMonth() + 1).padStart(2, "0")}-${String(user.dob.getDate()).padStart(2, "0")}`
+                    : (user.dob ? String(user.dob).slice(0, 10) : ""),
+                age: user.age ?? "",
+                phone: user.phone ?? "",
+                occupation: user.occupation ?? "",
                 role: user.role,
                 branch: user.branch || "",
                 profile_picture: user.profile_picture || ""
@@ -546,6 +553,49 @@ app.put('/api/update-appointment-status', async (req, res) => {
     }
 });
 
+// Patient reschedule requests are stored separately until staff approves them.
+app.post('/api/request-reschedule', async (req, res) => {
+    const { appointment_id, user_id, requested_date, requested_time } = req.body || {};
+
+    if (!appointment_id || !user_id || !requested_date || !requested_time) {
+        return res.status(400).json({ message: 'Appointment, date, and time are required.' });
+    }
+
+    try {
+        const { rows: appointments } = await db.query(
+            `SELECT id, status, dentist_name
+             FROM appointments
+             WHERE id = $1 AND user_id = $2`,
+            [appointment_id, user_id]
+        );
+        if (appointments.length === 0) return res.status(404).json({ message: 'Appointment not found.' });
+        if (appointments[0].status !== 'Confirmed') {
+            return res.status(400).json({ message: 'Only confirmed appointments can be rescheduled.' });
+        }
+
+        const { rows: conflicts } = await db.query(
+            `SELECT id FROM appointments
+             WHERE appointment_date = $1 AND appointment_time = $2 AND dentist_name = $3
+               AND id <> $4 AND status NOT IN ('Cancelled', 'Denied') LIMIT 1`,
+            [requested_date, requested_time, appointments[0].dentist_name, appointment_id]
+        );
+        if (conflicts.length > 0) return res.status(409).json({ message: 'That dentist time is no longer available.' });
+
+        const { rows: updated } = await db.query(
+            `UPDATE appointments
+             SET reschedule_requested_date = $1, reschedule_requested_time = $2,
+                 status = 'Reschedule Requested'
+             WHERE id = $3
+             RETURNING id, status, reschedule_requested_date, reschedule_requested_time`,
+            [requested_date, requested_time, appointment_id]
+        );
+        res.status(200).json({ message: 'Reschedule request submitted for staff review.', appointment: updated[0] });
+    } catch (err) {
+        console.error('Reschedule request error:', err);
+        res.status(500).json({ message: 'Failed to save the reschedule request.' });
+    }
+});
+
 // Staff billing: retrieve appointments with the patient details needed for billing.
 app.get('/api/staff/billings', async (req, res) => {
     try {
@@ -596,9 +646,17 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
 });
 
 app.get('/api/appointments/check-availability', async (req, res) => {
-    const { date, dentist } = req.query;
+    const { date, dentist, excludeAppointmentId } = req.query;
     try {
-        const { rows: results } = await db.query('SELECT appointment_time, service_type FROM appointments WHERE appointment_date = $1 AND dentist_name = $2', [date, dentist]);
+        const values = [date, dentist];
+        let query = `SELECT appointment_time, service_type FROM appointments
+                     WHERE appointment_date = $1 AND dentist_name = $2
+                       AND status NOT IN ('Cancelled', 'Denied')`;
+        if (excludeAppointmentId) {
+            values.push(excludeAppointmentId);
+            query += ' AND id <> $3';
+        }
+        const { rows: results } = await db.query(query, values);
         const bookedData = results.map(row => ({ time: row.appointment_time, service: row.service_type }));
         res.status(200).json(bookedData);
     } catch (err) {
