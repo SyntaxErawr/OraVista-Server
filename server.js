@@ -105,6 +105,39 @@ const transporter = nodemailer.createTransport({
     }
 });
 
+const CLINIC_TIME_ZONE = 'Asia/Manila';
+
+function dateOnly(date) {
+    if (date instanceof Date && !Number.isNaN(date.getTime())) {
+        return date.toISOString().slice(0, 10);
+    }
+    const match = String(date || '').match(/^\d{4}-\d{2}-\d{2}/);
+    return match ? match[0] : null;
+}
+
+function appointmentDateTime(date, time) {
+    const match = String(time || '').trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    if (!match) return null;
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const period = match[3].toUpperCase();
+    if (hour < 1 || hour > 12 || minute > 59) return null;
+    if (period === 'PM' && hour !== 12) hour += 12;
+    if (period === 'AM' && hour === 12) hour = 0;
+    const appointmentDay = dateOnly(date);
+    if (!appointmentDay) return null;
+    return new Date(`${appointmentDay}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00+08:00`);
+}
+
+function formatAppointmentDate(date) {
+    const appointmentDay = dateOnly(date);
+    if (!appointmentDay) return 'your scheduled date';
+    return new Intl.DateTimeFormat('en-PH', {
+        timeZone: CLINIC_TIME_ZONE,
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+    }).format(new Date(`${appointmentDay}T00:00:00+08:00`));
+}
+
 // ---------------------------------------------------------
 // MULTER CONFIGURATION FOR UPLOADS
 // ---------------------------------------------------------
@@ -456,6 +489,29 @@ app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, re
     }
 });
 
+// Retrieve dentist-saved diagnoses directly; do not pair them with unrelated uploads.
+app.get('/api/patient-final-diagnoses/:userId', async (req, res) => {
+    const userId = Number(req.params.userId);
+    if (!Number.isSafeInteger(userId) || userId <= 0) {
+        return res.status(400).json({ message: 'Invalid patient ID.' });
+    }
+    try {
+        const { rows } = await db.query(
+            `SELECT id, patient_id, clinical_notes, ai_findings, scan_date
+             FROM ai_diagnostics
+             WHERE patient_id = $1
+               AND ai_findings::jsonb ->> 'human_verified' = 'true'
+             ORDER BY scan_date DESC NULLS LAST, id DESC`,
+            [userId]
+        );
+        res.set('Cache-Control', 'no-store');
+        res.status(200).json(rows);
+    } catch (err) {
+        console.error('Final diagnosis retrieval error:', err);
+        res.status(500).json({ message: 'Failed to retrieve saved final diagnoses.' });
+    }
+});
+
 app.get('/api/patient-records/:userId', async (req, res) => {
     try {
         const userId = req.params.userId;
@@ -547,9 +603,191 @@ app.put('/api/update-appointment-status', async (req, res) => {
     const { appointment_id, status } = req.body;
     try {
         await db.query('UPDATE appointments SET status = $1 WHERE id = $2', [status, appointment_id]);
+
+        if (status === 'Confirmed') {
+            const { rows } = await db.query(
+                `SELECT a.id, a.service_type, a.dentist_name, a.appointment_date,
+                        a.appointment_time, a.amount, a.branch,
+                        u.first_name, u.email
+                 FROM appointments a
+                 JOIN users u ON u.id = a.user_id
+                 WHERE a.id = $1`,
+                [appointment_id]
+            );
+
+            if (rows.length > 0) {
+                const appointment = rows[0];
+                const formattedAmount = Number(appointment.amount || 0).toLocaleString('en-PH', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2
+                });
+                const notificationTitle = 'Appointment Confirmed';
+                const notificationMessage = `Your ${appointment.service_type} appointment with ${appointment.dentist_name} on ${appointment.appointment_date} at ${appointment.appointment_time} has been confirmed. Base price: ₱${formattedAmount}.`;
+
+                const notificationInsert = await db.query(
+                    `INSERT INTO notifications
+                        (user_id, appointment_id, notification_type, title, message)
+                     SELECT a.user_id, $1, 'appointment_confirmed', $2, $3
+                     FROM appointments a
+                     WHERE a.id = $1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM notifications n
+                           WHERE n.user_id = a.user_id
+                             AND n.appointment_id = a.id
+                             AND n.notification_type = 'appointment_confirmed'
+                       )`,
+                    [appointment.id, notificationTitle, notificationMessage]
+                );
+
+                if (notificationInsert.rowCount > 0) {
+                    try {
+                    await transporter.sendMail({
+                        from: process.env.EMAIL_USER,
+                        to: appointment.email,
+                        subject: 'OraVista - Appointment Confirmed',
+                        html: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;">
+                            <h2>King Epres Dental Clinic</h2>
+                            <p>Hello ${appointment.first_name},</p>
+                            <p>Your appointment has been confirmed.</p>
+                            <p><strong>Service:</strong> ${appointment.service_type}</p>
+                            <p><strong>Base Price:</strong> ₱${formattedAmount}</p>
+                            <p><strong>Dentist:</strong> ${appointment.dentist_name}</p>
+                            <p><strong>Date:</strong> ${appointment.appointment_date}</p>
+                            <p><strong>Time:</strong> ${appointment.appointment_time}</p>
+                            <p><strong>Branch:</strong> ${appointment.branch || 'Main Branch'}</p>
+                            <p>Status: <strong>Confirmed</strong></p>
+                        </div>`
+                    });
+                    } catch (emailError) {
+                        console.error('Appointment confirmation email error:', emailError);
+                    }
+                }
+            }
+        }
+
         res.status(200).json({ message: `Appointment marked as ${status}.` });
     } catch (err) {
         res.status(500).json({ message: "Server error." });
+    }
+});
+
+app.get('/api/notifications/:userId', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT id, appointment_id, notification_type, title, message, is_read, created_at
+             FROM notifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT 20`,
+            [req.params.userId]
+        );
+        res.status(200).json(rows);
+    } catch (err) {
+        console.error('Notification fetch error:', err);
+        res.status(500).json({ message: 'Failed to fetch notifications.' });
+    }
+});
+
+app.put('/api/notifications/:notificationId/read', async (req, res) => {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ message: 'User is required.' });
+    try {
+        await db.query('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [req.params.notificationId, user_id]);
+        res.status(200).json({ message: 'Notification marked as read.' });
+    } catch (err) {
+        console.error('Notification read error:', err);
+        res.status(500).json({ message: 'Failed to update notification.' });
+    }
+});
+
+// Staff can flag an appointment only after its scheduled time plus the 15-minute grace period.
+app.put('/api/appointments/:appointmentId/late-no-show', async (req, res) => {
+    try {
+        const { rows } = await db.query(
+            `SELECT a.id, a.user_id, a.status, a.service_type, a.dentist_name, a.appointment_date, a.appointment_time, u.first_name, u.email
+             FROM appointments a JOIN users u ON u.id = a.user_id WHERE a.id = $1`,
+            [req.params.appointmentId]
+        );
+        if (!rows.length) return res.status(404).json({ message: 'Appointment not found.' });
+        const appointment = rows[0];
+        if (!['Confirmed', 'Late / No Show'].includes(appointment.status)) {
+            return res.status(400).json({ message: 'Only confirmed appointments can be marked late/no show.' });
+        }
+        if (appointment.status === 'Confirmed') {
+            const scheduledAt = appointmentDateTime(appointment.appointment_date, appointment.appointment_time);
+            if (!scheduledAt) return res.status(400).json({ message: 'Appointment time is invalid.' });
+            if (Date.now() < scheduledAt.getTime() + (15 * 60 * 1000)) return res.status(400).json({ message: 'The 15-minute grace period has not ended yet.' });
+            await db.query("UPDATE appointments SET status = 'Late / No Show' WHERE id = $1", [appointment.id]);
+        }
+        const title = 'Appointment marked Late / No Show';
+        const message = `Your ${appointment.service_type} appointment on ${formatAppointmentDate(appointment.appointment_date)} at ${appointment.appointment_time} was marked Late / No Show. You may cancel it or request to reschedule.`;
+        const inserted = await db.query(
+            `INSERT INTO notifications (user_id, appointment_id, notification_type, title, message)
+             SELECT $1, $2, 'appointment_late_no_show', $3, $4
+             WHERE NOT EXISTS (SELECT 1 FROM notifications WHERE user_id = $1 AND appointment_id = $2 AND notification_type = 'appointment_late_no_show')`,
+            [appointment.user_id, appointment.id, title, message]
+        );
+        if (inserted.rowCount > 0) {
+            try {
+                await transporter.sendMail({
+                    from: process.env.EMAIL_USER,
+                    to: appointment.email,
+                    subject: 'OraVista - Action needed for your appointment',
+                    html: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;"><h2>King Epres Dental Clinic</h2><p>Hello ${appointment.first_name},</p><p>Your <strong>${appointment.service_type}</strong> appointment on <strong>${formatAppointmentDate(appointment.appointment_date)} at ${appointment.appointment_time}</strong> was marked Late / No Show after the 15-minute grace period.</p><p>Please sign in to OraVista to cancel the appointment or request a new schedule.</p></div>`
+                });
+            } catch (emailError) {
+                console.error('Late/no-show email error:', emailError);
+            }
+        }
+        res.status(200).json({ message: 'Appointment marked Late / No Show.' });
+    } catch (err) {
+        console.error('Late/no-show update error:', err);
+        res.status(500).json({ message: 'Failed to mark appointment late/no show.' });
+    }
+});
+
+app.put('/api/appointments/:appointmentId/cancel', async (req, res) => {
+    const { user_id } = req.body || {};
+    if (!user_id) return res.status(400).json({ message: 'User is required.' });
+    try {
+        const result = await db.query(`UPDATE appointments SET status = 'Cancelled' WHERE id = $1 AND user_id = $2 AND status = 'Late / No Show'`, [req.params.appointmentId, user_id]);
+        if (!result.rowCount) return res.status(400).json({ message: 'Only your late/no-show appointment can be cancelled here.' });
+        res.status(200).json({ message: 'Appointment cancelled.' });
+    } catch (err) {
+        console.error('Late/no-show cancellation error:', err);
+        res.status(500).json({ message: 'Failed to cancel appointment.' });
+    }
+});
+
+// Invoke once per day with Cloud Scheduler using the x-cron-secret header.
+app.post('/api/jobs/send-appointment-reminders', async (req, res) => {
+    if (!process.env.REMINDER_CRON_SECRET || req.get('x-cron-secret') !== process.env.REMINDER_CRON_SECRET) return res.status(401).json({ message: 'Unauthorized.' });
+    try {
+        const { rows } = await db.query(`
+            SELECT a.id, a.service_type, a.dentist_name, a.appointment_date, a.appointment_time, u.first_name, u.email
+            FROM appointments a JOIN users u ON u.id = a.user_id
+            WHERE a.status = 'Confirmed'
+              AND a.appointment_date = ((NOW() AT TIME ZONE '${CLINIC_TIME_ZONE}')::date + 1)
+              AND a.reminder_email_sent_at IS NULL
+        `);
+        let sent = 0;
+        for (const appointment of rows) {
+            try {
+                await transporter.sendMail({
+                    from: process.env.EMAIL_USER, to: appointment.email,
+                    subject: 'OraVista - Appointment reminder for tomorrow',
+                    html: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;"><h2>King Epres Dental Clinic</h2><p>Hello ${appointment.first_name},</p><p>This is a reminder that your <strong>${appointment.service_type}</strong> appointment is tomorrow.</p><p><strong>Date:</strong> ${formatAppointmentDate(appointment.appointment_date)}<br/><strong>Time:</strong> ${appointment.appointment_time}<br/><strong>Dentist:</strong> ${appointment.dentist_name}</p></div>`
+                });
+                await db.query('UPDATE appointments SET reminder_email_sent_at = NOW() WHERE id = $1 AND reminder_email_sent_at IS NULL', [appointment.id]);
+                sent += 1;
+            } catch (emailError) {
+                console.error(`Reminder email error for appointment ${appointment.id}:`, emailError);
+            }
+        }
+        res.status(200).json({ message: 'Reminder job finished.', sent, matched: rows.length });
+    } catch (err) {
+        console.error('Reminder job error:', err);
+        res.status(500).json({ message: 'Failed to send appointment reminders.' });
     }
 });
 
@@ -569,8 +807,8 @@ app.post('/api/request-reschedule', async (req, res) => {
             [appointment_id, user_id]
         );
         if (appointments.length === 0) return res.status(404).json({ message: 'Appointment not found.' });
-        if (appointments[0].status !== 'Confirmed') {
-            return res.status(400).json({ message: 'Only confirmed appointments can be rescheduled.' });
+        if (!['Confirmed', 'Late / No Show'].includes(appointments[0].status)) {
+            return res.status(400).json({ message: 'Only confirmed or late/no-show appointments can be rescheduled.' });
         }
 
         const { rows: conflicts } = await db.query(
