@@ -562,6 +562,126 @@ app.get('/api/patient-records/:userId', async (req, res) => {
 // APPOINTMENT ROUTES
 // ---------------------------------------------------------
 
+// Use the same service durations as the booking page when checking overlapping slots.
+const appointmentDurations = {
+    'Oral Prophylaxis': 30, Restoration: 60, Extraction: 60,
+    'Braces Installation': 60, 'Braces Adjustment': 30, Veneers: 120,
+    'Root Canal (RCT)': 120, 'Wisdom Tooth Surgery': 180, Dentures: 30,
+    'Fixed Bridge': 120, 'Teeth Whitening': 90
+};
+function appointmentDuration(service) {
+    const name = String(service || '').trim();
+    if (appointmentDurations[name]) return appointmentDurations[name];
+    const hours = name.match(/(\d+(?:\.\d+)?)\s*hrs?/i);
+    const minutes = name.match(/(\d+)\s*mins?/i);
+    return (hours ? Number(hours[1]) * 60 : 0) + (minutes ? Number(minutes[1]) : 0) || 30;
+}
+function slotMinutes(value) {
+    const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+    if (!match) return null;
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const second = Number(match[3] || 0);
+    const period = match[4]?.toUpperCase();
+    if (minute > 59 || second > 59 || hour > (period ? 12 : 23) || (period && hour < 1)) return null;
+    if (period) hour = hour % 12 + (period === 'PM' ? 12 : 0);
+    return hour * 60 + minute + second / 60;
+}
+function appointmentTimeWithSeconds(value) {
+    const minutes = slotMinutes(value);
+    if (minutes === null) return String(value || 'Time not provided');
+    const seconds = Math.round(minutes * 60);
+    const hour = Math.floor(seconds / 3600);
+    return `${String(hour % 12 || 12).padStart(2, '0')}:${String(Math.floor(seconds / 60) % 60).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')} ${hour >= 12 ? 'PM' : 'AM'}`;
+}
+function appointmentError(message, statusCode = 400) {
+    return Object.assign(new Error(message), { statusCode });
+}
+function validateRequestedSlot(date, time) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || '')) || slotMinutes(time) === null) {
+        throw appointmentError('A valid appointment date and time are required.');
+    }
+    const day = new Date(`${date}T00:00:00Z`);
+    if (Number.isNaN(day.getTime()) || day.toISOString().slice(0, 10) !== date) {
+        throw appointmentError('Invalid appointment date.');
+    }
+    const scheduledAt = new Date(`${date}T00:00:00+08:00`).getTime() + slotMinutes(time) * 60000;
+    if (scheduledAt <= Date.now()) throw appointmentError('Please choose a future appointment date and time.');
+}
+async function withAppointmentWrite(work) {
+    const client = await db.connect();
+    try {
+        await client.query('BEGIN');
+        // Short database lock also prevents a concurrent booking from taking an approved slot.
+        await client.query('LOCK TABLE appointments IN SHARE ROW EXCLUSIVE MODE');
+        const result = await work(client);
+        await client.query('COMMIT');
+        return result;
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+async function assertAppointmentSlotAvailable(client, date, time, dentist, service, excludedId = null) {
+    const start = slotMinutes(time);
+    if (start === null) throw appointmentError('Invalid appointment time.');
+    const { rows } = await client.query(
+        `SELECT appointment_time AS time, service_type FROM appointments
+         WHERE appointment_date = $1 AND dentist_name = $2
+           AND ($3::integer IS NULL OR id <> $3)
+           AND COALESCE(status, 'Pending') NOT IN ('Cancelled', 'Canceled', 'Denied')
+         UNION ALL
+         SELECT reschedule_requested_time AS time, service_type FROM appointments
+         WHERE reschedule_requested_date = $1 AND dentist_name = $2
+           AND ($3::integer IS NULL OR id <> $3) AND status = 'Reschedule Requested'`,
+        [date, dentist, excludedId]
+    );
+    const end = start + appointmentDuration(service);
+    const conflict = rows.some((row) => {
+        const otherStart = slotMinutes(row.time);
+        return otherStart === null || (start < otherStart + appointmentDuration(row.service_type) && end > otherStart);
+    });
+    if (conflict) throw appointmentError('That dentist is no longer available for the requested time. Please choose another slot.', 409);
+}
+function escapeAppointmentHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[character]));
+}
+async function approveRequestedSchedule(client, appointment, request) {
+    const newDate = appointment.requested_day;
+    const newTime = appointment.reschedule_requested_time;
+    if (!newDate || !newTime) throw appointmentError('This appointment has no complete reschedule request.', 409);
+    if ((request.expected_requested_date && request.expected_requested_date !== newDate) ||
+        (request.expected_requested_time && request.expected_requested_time !== newTime)) {
+        throw appointmentError('The reschedule request changed. Refresh the appointment list before approving.', 409);
+    }
+    validateRequestedSlot(newDate, newTime);
+    await assertAppointmentSlotAvailable(client, newDate, newTime, appointment.dentist_name, appointment.service_type, appointment.id);
+    const { rows } = await client.query(
+        `UPDATE appointments SET appointment_date = reschedule_requested_date,
+         appointment_time = reschedule_requested_time, status = 'Confirmed',
+         reschedule_requested_date = NULL, reschedule_requested_time = NULL,
+         reminder_email_sent_at = NULL WHERE id = $1 RETURNING *`, [appointment.id]
+    );
+    const { rows: patients } = await client.query('SELECT first_name, email FROM users WHERE id = $1', [appointment.user_id]);
+    const patient = patients[0] || {};
+    const oldSchedule = `${formatAppointmentDate(appointment.original_day)} at ${appointmentTimeWithSeconds(appointment.appointment_time)}`;
+    const newSchedule = `${formatAppointmentDate(newDate)} at ${appointmentTimeWithSeconds(newTime)}`;
+    const amount = Number(appointment.amount || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const message = `Your reschedule request for ${appointment.service_type} with ${appointment.dentist_name} has been approved. Previous schedule: ${oldSchedule}. New schedule: ${newSchedule}. Branch: ${appointment.branch || 'Main Branch'}. Base price: ₱${amount}.`;
+    // Each completed approval has its own event, including repeated reschedules of one appointment.
+    const notificationType = `reschedule_approved_${crypto.randomBytes(12).toString('hex')}`;
+    await client.query(
+        `INSERT INTO notifications (user_id, appointment_id, notification_type, title, message)
+         VALUES ($1, $2, $3, 'Reschedule Approved', $4)`,
+        [appointment.user_id, appointment.id, notificationType, message]
+    );
+    return { appointment: rows[0], patient, message };
+}
+
 app.post('/api/book-appointment', async (req, res) => {
     const { user_id, service_type, dentist_name, appointment_date, appointment_time, amount, branch } = req.body;
 
@@ -578,7 +698,11 @@ app.post('/api/book-appointment', async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
 
-        await db.query(query, [user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, 'Pending', amountToSave, branchToSave]);
+        validateRequestedSlot(appointment_date, appointment_time);
+        await withAppointmentWrite(async (client) => {
+            await assertAppointmentSlotAvailable(client, appointment_date, appointment_time, dentist_name, service_type);
+            await client.query(query, [user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, 'Pending', amountToSave, branchToSave]);
+        });
 
         res.status(201).json({
             message: "Appointment booked successfully!",
@@ -586,7 +710,7 @@ app.post('/api/book-appointment', async (req, res) => {
         });
     } catch (err) {
         console.error("Booking Error:", err);
-        res.status(500).json({ message: "Failed to book appointment." });
+        res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : "Failed to book appointment." });
     }
 });
 
@@ -600,9 +724,47 @@ app.get('/api/user-appointments/:userId', async (req, res) => {
 });
 
 app.put('/api/update-appointment-status', async (req, res) => {
-    const { appointment_id, status } = req.body;
+    const { appointment_id, status, expected_status } = req.body || {};
     try {
-        await db.query('UPDATE appointments SET status = $1 WHERE id = $2', [status, appointment_id]);
+        const result = await withAppointmentWrite(async (client) => {
+            const { rows } = await client.query(
+                `SELECT *, to_char(appointment_date, 'YYYY-MM-DD') AS original_day,
+                 to_char(reschedule_requested_date, 'YYYY-MM-DD') AS requested_day
+                 FROM appointments WHERE id = $1 FOR UPDATE`, [appointment_id]
+            );
+            const appointment = rows[0];
+            if (!appointment) throw appointmentError('Appointment not found.', 404);
+            if (expected_status && appointment.status !== expected_status) {
+                throw appointmentError('This appointment changed. Refresh the list and try again.', 409);
+            }
+            if (status === 'Confirmed' && appointment.status === 'Reschedule Requested') {
+                return await approveRequestedSchedule(client, appointment, req.body);
+            }
+            if (status === 'Confirmed' && !['Pending', 'Approved', 'Confirmed'].includes(appointment.status)) {
+                throw appointmentError('This appointment can no longer be confirmed.', 409);
+            }
+            await client.query('UPDATE appointments SET status = $1 WHERE id = $2', [status, appointment_id]);
+            return null;
+        });
+        if (result) {
+            let emailSent = false;
+            try {
+                if (!result.patient.email) throw new Error('Patient email is missing.');
+                await transporter.sendMail({
+                    from: process.env.EMAIL_USER, to: result.patient.email,
+                    subject: 'OraVista - Reschedule Approved',
+                    html: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;"><h2>King Epres Dental Clinic</h2><p>Hello ${escapeAppointmentHtml(result.patient.first_name)},</p><p>${escapeAppointmentHtml(result.message)}</p><p>You can view your updated appointment in OraVista.</p></div>`
+                });
+                emailSent = true;
+            } catch (error) {
+                console.error('Reschedule approval email error:', error);
+            }
+            return res.status(200).json({
+                message: 'Reschedule approved. The appointment schedule and patient notification have been updated.',
+                appointment: result.appointment, email_sent: emailSent,
+                warning: emailSent ? null : 'The reschedule was approved, but its email could not be sent. Please check the server email logs.'
+            });
+        }
 
         if (status === 'Confirmed') {
             const { rows } = await db.query(
@@ -667,7 +829,7 @@ app.put('/api/update-appointment-status', async (req, res) => {
 
         res.status(200).json({ message: `Appointment marked as ${status}.` });
     } catch (err) {
-        res.status(500).json({ message: "Server error." });
+        res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : "Server error." });
     }
 });
 
@@ -747,14 +909,21 @@ app.put('/api/appointments/:appointmentId/late-no-show', async (req, res) => {
 });
 
 app.put('/api/appointments/:appointmentId/cancel', async (req, res) => {
-    const { user_id } = req.body || {};
+    const { user_id, expected_status } = req.body || {};
     if (!user_id) return res.status(400).json({ message: 'User is required.' });
     try {
-        const result = await db.query(`UPDATE appointments SET status = 'Cancelled' WHERE id = $1 AND user_id = $2 AND status = 'Late / No Show'`, [req.params.appointmentId, user_id]);
-        if (!result.rowCount) return res.status(400).json({ message: 'Only your late/no-show appointment can be cancelled here.' });
-        res.status(200).json({ message: 'Appointment cancelled.' });
+        const { rows } = await db.query(
+            `UPDATE appointments SET status = 'Cancelled', reschedule_requested_date = NULL,
+             reschedule_requested_time = NULL
+             WHERE id = $1 AND user_id = $2
+               AND status IN ('Pending', 'Approved', 'Confirmed', 'Late / No Show')
+               AND ($3::text IS NULL OR status = $3) RETURNING *`,
+            [req.params.appointmentId, user_id, expected_status || null]
+        );
+        if (!rows.length) return res.status(409).json({ message: 'The appointment changed or cannot be cancelled. Refresh the list and try again.' });
+        res.status(200).json({ message: 'Appointment cancelled.', appointment: rows[0] });
     } catch (err) {
-        console.error('Late/no-show cancellation error:', err);
+        console.error('Appointment cancellation error:', err);
         res.status(500).json({ message: 'Failed to cancel appointment.' });
     }
 });
@@ -794,43 +963,33 @@ app.post('/api/jobs/send-appointment-reminders', async (req, res) => {
 // Patient reschedule requests are stored separately until staff approves them.
 app.post('/api/request-reschedule', async (req, res) => {
     const { appointment_id, user_id, requested_date, requested_time } = req.body || {};
-
     if (!appointment_id || !user_id || !requested_date || !requested_time) {
         return res.status(400).json({ message: 'Appointment, date, and time are required.' });
     }
-
     try {
-        const { rows: appointments } = await db.query(
-            `SELECT id, status, dentist_name
-             FROM appointments
-             WHERE id = $1 AND user_id = $2`,
-            [appointment_id, user_id]
-        );
-        if (appointments.length === 0) return res.status(404).json({ message: 'Appointment not found.' });
-        if (!['Confirmed', 'Late / No Show'].includes(appointments[0].status)) {
-            return res.status(400).json({ message: 'Only confirmed or late/no-show appointments can be rescheduled.' });
-        }
-
-        const { rows: conflicts } = await db.query(
-            `SELECT id FROM appointments
-             WHERE appointment_date = $1 AND appointment_time = $2 AND dentist_name = $3
-               AND id <> $4 AND status NOT IN ('Cancelled', 'Denied') LIMIT 1`,
-            [requested_date, requested_time, appointments[0].dentist_name, appointment_id]
-        );
-        if (conflicts.length > 0) return res.status(409).json({ message: 'That dentist time is no longer available.' });
-
-        const { rows: updated } = await db.query(
-            `UPDATE appointments
-             SET reschedule_requested_date = $1, reschedule_requested_time = $2,
-                 status = 'Reschedule Requested'
-             WHERE id = $3
-             RETURNING id, status, reschedule_requested_date, reschedule_requested_time`,
-            [requested_date, requested_time, appointment_id]
-        );
-        res.status(200).json({ message: 'Reschedule request submitted for staff review.', appointment: updated[0] });
+        validateRequestedSlot(requested_date, requested_time);
+        const appointment = await withAppointmentWrite(async (client) => {
+            const { rows } = await client.query(
+                `SELECT * FROM appointments WHERE id = $1 AND user_id = $2 FOR UPDATE`,
+                [appointment_id, user_id]
+            );
+            if (!rows.length) throw appointmentError('Appointment not found.', 404);
+            const current = rows[0];
+            if (!['Confirmed', 'Late / No Show'].includes(current.status)) {
+                throw appointmentError('Only confirmed or late/no-show appointments can be rescheduled.', 409);
+            }
+            await assertAppointmentSlotAvailable(client, requested_date, requested_time, current.dentist_name, current.service_type, current.id);
+            const { rows: updated } = await client.query(
+                `UPDATE appointments SET reschedule_requested_date = $1, reschedule_requested_time = $2,
+                 status = 'Reschedule Requested' WHERE id = $3 RETURNING *`,
+                [requested_date, requested_time, appointment_id]
+            );
+            return updated[0];
+        });
+        res.status(200).json({ message: 'Reschedule request submitted for staff review.', appointment });
     } catch (err) {
         console.error('Reschedule request error:', err);
-        res.status(500).json({ message: 'Failed to save the reschedule request.' });
+        res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Failed to save the reschedule request.' });
     }
 });
 
@@ -886,19 +1045,20 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
 app.get('/api/appointments/check-availability', async (req, res) => {
     const { date, dentist, excludeAppointmentId } = req.query;
     try {
-        const values = [date, dentist];
-        let query = `SELECT appointment_time, service_type FROM appointments
-                     WHERE appointment_date = $1 AND dentist_name = $2
-                       AND status NOT IN ('Cancelled', 'Denied')`;
-        if (excludeAppointmentId) {
-            values.push(excludeAppointmentId);
-            query += ' AND id <> $3';
-        }
-        const { rows: results } = await db.query(query, values);
-        const bookedData = results.map(row => ({ time: row.appointment_time, service: row.service_type }));
-        res.status(200).json(bookedData);
+        const { rows } = await db.query(
+            `SELECT appointment_time AS time, service_type AS service FROM appointments
+             WHERE appointment_date = $1 AND dentist_name = $2
+               AND ($3::integer IS NULL OR id <> $3)
+               AND COALESCE(status, 'Pending') NOT IN ('Cancelled', 'Canceled', 'Denied')
+             UNION ALL
+             SELECT reschedule_requested_time AS time, service_type AS service FROM appointments
+             WHERE reschedule_requested_date = $1 AND dentist_name = $2
+               AND ($3::integer IS NULL OR id <> $3) AND status = 'Reschedule Requested'`,
+            [date, dentist, excludeAppointmentId || null]
+        );
+        res.status(200).json(rows);
     } catch (err) {
-        res.status(500).json({ message: "Error checking availability" });
+        res.status(500).json({ message: 'Error checking availability' });
     }
 });
 
@@ -915,6 +1075,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
 
         const { rows: scheduleRows } = await db.query(`
             SELECT a.id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type,
+            to_char(a.reschedule_requested_date, 'YYYY-MM-DD') AS requested_date, a.reschedule_requested_time,
             CONCAT(u.first_name, ' ', u.last_name) as patient_name
             FROM appointments a
             LEFT JOIN users u ON a.user_id = u.id
@@ -934,7 +1095,9 @@ app.get('/api/dashboard/stats', async (req, res) => {
                 dentist: row.dentist_name,
                 patientName: row.patient_name || "Guest",
                 status: row.status,
-                serviceType: row.service_type
+                serviceType: row.service_type,
+                requestedDate: row.requested_date,
+                requestedTime: row.reschedule_requested_time
             }))
         });
     } catch (err) {
