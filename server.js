@@ -497,11 +497,11 @@ app.get('/api/patient-final-diagnoses/:userId', async (req, res) => {
     }
     try {
         const { rows } = await db.query(
-            `SELECT id, patient_id, clinical_notes, ai_findings, scan_date
+            `SELECT diagnosis_id AS id, patient_id, clinical_notes, ai_findings, scan_date
              FROM ai_diagnostics
              WHERE patient_id = $1
                AND ai_findings::jsonb ->> 'human_verified' = 'true'
-             ORDER BY scan_date DESC NULLS LAST, id DESC`,
+             ORDER BY scan_date DESC NULLS LAST, diagnosis_id DESC`,
             [userId]
         );
         res.set('Cache-Control', 'no-store');
