@@ -1071,12 +1071,12 @@ app.get('/api/dashboard/stats', async (req, res) => {
         const { rows: monthPatientsRows } = await db.query(`SELECT COUNT(DISTINCT user_id) as count FROM appointments WHERE EXTRACT(MONTH FROM appointment_date) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM appointment_date) = EXTRACT(YEAR FROM CURRENT_DATE)`);
 
         const { rows: scheduleRows } = await db.query(`
-            SELECT a.id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type,
+            SELECT a.id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type, a.created_at,
             to_char(a.reschedule_requested_date, 'YYYY-MM-DD') AS requested_date, a.reschedule_requested_time,
             CONCAT(u.first_name, ' ', u.last_name) as patient_name
             FROM appointments a
             LEFT JOIN users u ON a.user_id = u.id
-            ORDER BY a.appointment_date ASC, a.appointment_time ASC
+            ORDER BY a.created_at ASC, a.id ASC
         `);
 
         res.json({
@@ -1093,6 +1093,7 @@ app.get('/api/dashboard/stats', async (req, res) => {
                 patientName: row.patient_name || "Guest",
                 status: row.status,
                 serviceType: row.service_type,
+                bookedAt: row.created_at,
                 requestedDate: row.requested_date,
                 requestedTime: row.reschedule_requested_time
             }))
