@@ -876,9 +876,6 @@ app.put('/api/appointments/:appointmentId/late-no-show', async (req, res) => {
             return res.status(400).json({ message: 'Only confirmed appointments can be marked late/no show.' });
         }
         if (appointment.status === 'Confirmed') {
-            const scheduledAt = appointmentDateTime(appointment.appointment_date, appointment.appointment_time);
-            if (!scheduledAt) return res.status(400).json({ message: 'Appointment time is invalid.' });
-            if (Date.now() < scheduledAt.getTime() + (15 * 60 * 1000)) return res.status(400).json({ message: 'The 15-minute grace period has not ended yet.' });
             await db.query("UPDATE appointments SET status = 'Late / No Show' WHERE id = $1", [appointment.id]);
         }
         const title = 'Appointment marked Late / No Show';
