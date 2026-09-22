@@ -183,6 +183,129 @@ app.post('/api/signup', async (req, res) => {
     }
 });
 
+
+// ---------------------------------------------------------
+// MOBILE COMPATIBILITY: REGISTRATION / AUTH LOOKUPS
+// These routes use the same users table as the web portal.
+// ---------------------------------------------------------
+app.post('/api/register', async (req, res) => {
+    const { firstName, lastName, email, phone, password, role, branch } = req.body || {};
+
+    if (!firstName || !lastName || !email || !password) {
+        return res.status(400).json({ message: "Missing required registration information." });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanEmail)) {
+        return res.status(400).json({ message: "Invalid email format." });
+    }
+
+    try {
+        const { rows: existingUser } = await db.query(
+            'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+            [cleanEmail]
+        );
+        if (existingUser.length > 0) {
+            return res.status(400).json({ message: "Email is already registered." });
+        }
+
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+        const userRole = role || 'patient';
+        const userBranch = branch || 'Main Branch';
+
+        await db.query(
+            `INSERT INTO users (first_name, last_name, email, password, role, phone, branch)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [firstName, lastName, cleanEmail, hashedPassword, userRole, phone || null, userBranch]
+        );
+
+        return res.status(201).json({ message: "Registration successful!" });
+    } catch (err) {
+        console.error("Mobile Registration Error:", err);
+        return res.status(500).json({ message: "Server error during registration." });
+    }
+});
+
+app.post('/api/verify-otp', async (req, res) => {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ message: "Email is required." });
+
+    try {
+        const { rows } = await db.query(
+            'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
+            [String(email).trim()]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: "User not found." });
+        }
+
+        const user = { ...rows[0] };
+        delete user.password;
+        return res.status(200).json({
+            message: "Verified",
+            token: "logged_in_token",
+            user
+        });
+    } catch (err) {
+        console.error("Verify OTP Error:", err);
+        return res.status(500).json({ message: "Server error." });
+    }
+});
+
+app.post('/api/forgot-password', async (req, res) => {
+    const { email, action } = req.body || {};
+    if (!email) return res.status(400).json({ message: "Email is required." });
+
+    const cleanEmail = String(email).trim().toLowerCase();
+
+    try {
+        const { rows } = await db.query(
+            'SELECT first_name FROM users WHERE LOWER(email) = LOWER($1)',
+            [cleanEmail]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: "Email not found." });
+        }
+
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const isChange = action === 'change';
+        const emailSubject = isChange
+            ? 'OraVista - Change Password Request'
+            : 'OraVista - Forgot Password Request';
+        const emailBody = isChange
+            ? 'You requested to change your password from settings. Use this code to authorize the change.'
+            : 'Use this code to recover your account and set a new password.';
+
+        if (process.env.ENVIRONMENT === 'local') {
+            console.log(`\n[DEV MODE] Bypass active. OTP for ${cleanEmail} is: ${otp}\n`);
+        } else {
+            await transporter.sendMail({
+                from: process.env.EMAIL_USER,
+                to: cleanEmail,
+                subject: emailSubject,
+                html: `
+                    <div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;">
+                        <h2>King Epres Dental Clinic</h2>
+                        <p>Hello ${rows[0].first_name || 'Patient'},</p>
+                        <p>${emailBody}</p>
+                        <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 5px;">${otp}</h1>
+                    </div>
+                `
+            });
+        }
+
+        return res.status(200).json({
+            message: "OTP sent successfully!",
+            generatedOtp: otp
+        });
+    } catch (err) {
+        console.error("Forgot Password Error:", err);
+        return res.status(500).json({ message: "Server error." });
+    }
+});
+
 // ---------------------------------------------------------
 // ADMIN ROUTE: CREATE STAFF OR DENTIST
 // ---------------------------------------------------------
@@ -367,6 +490,29 @@ app.post('/api/send-otp', async (req, res) => {
 // ---------------------------------------------------------
 // PROFILE & SETTINGS ROUTES
 // ---------------------------------------------------------
+
+// Mobile compatibility: resolve a user profile by email.
+app.get('/api/user-profile', async (req, res) => {
+    const { email } = req.query;
+    if (!email) return res.status(400).json({ message: "Email is required." });
+
+    try {
+        const { rows } = await db.query(
+            'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
+            [String(email).trim()]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ message: "Not found" });
+        }
+
+        const user = { ...rows[0] };
+        delete user.password;
+        return res.status(200).json(user);
+    } catch (err) {
+        console.error("User Profile Error:", err);
+        return res.status(500).json({ message: "Error" });
+    }
+});
 
 app.put('/api/update-profile', async (req, res) => {
     const {
@@ -562,6 +708,59 @@ app.get('/api/patient-records/:userId', async (req, res) => {
 // APPOINTMENT ROUTES
 // ---------------------------------------------------------
 
+// Mobile and web currently use a few different display labels for the same
+// clinic data. Normalize only known mobile aliases before reading/writing the
+// shared appointments table; existing web labels pass through unchanged.
+const mobileServiceAliases = {
+    'Orthodontics Installation': 'Braces Installation',
+    'Orthodontics Adjustment': 'Braces Adjustment',
+    'Veneers / Esthetics': 'Veneers',
+    'Root Canal Treatment': 'Root Canal (RCT)',
+    'Whitening': 'Teeth Whitening'
+};
+const mobileServiceNames = Object.fromEntries(
+    Object.entries(mobileServiceAliases).map(([mobileName, webName]) => [webName, mobileName])
+);
+const mobileDentistAliases = {
+    'Queenie Balmedina DMD': 'Dra. Queenie Balmedina',
+    'Therese Madrid DMD': 'Dra. Theresa Madrid',
+    'Vicente Epres II DMD': 'Dr. Vicente Epres',
+    'Paulette Malit DMD': 'Dra.Paulette Maliit'
+};
+const mobileBranchAliases = {
+    'Sta. Ana': 'Sta. Ana, Manila',
+    'Angeles': 'Angeles, Pampanga'
+};
+const webServiceBasePrices = {
+    'Oral Prophylaxis': 1500,
+    Restoration: 1200,
+    Extraction: 1000,
+    'Braces Installation': 35000,
+    'Braces Adjustment': 1000,
+    Veneers: 15000,
+    'Root Canal (RCT)': 8000,
+    'Wisdom Tooth Surgery': 10000,
+    Dentures: 5000,
+    'Fixed Bridge': 12000,
+    'Teeth Whitening': 7000
+};
+function normalizeBookingService(value) {
+    const name = String(value || '').trim();
+    return mobileServiceAliases[name] || name;
+}
+function mobileBookingServiceName(value) {
+    const name = String(value || '').trim();
+    return mobileServiceNames[name] || name;
+}
+function normalizeBookingDentist(value) {
+    const name = String(value || '').trim();
+    return mobileDentistAliases[name] || name;
+}
+function normalizeBookingBranch(value) {
+    const name = String(value || '').trim();
+    return mobileBranchAliases[name] || name;
+}
+
 // Use the same service durations as the booking page when checking overlapping slots.
 const appointmentDurations = {
     'Oral Prophylaxis': 30, Restoration: 60, Extraction: 60,
@@ -683,14 +882,42 @@ async function approveRequestedSchedule(client, appointment, request) {
 }
 
 app.post('/api/book-appointment', async (req, res) => {
-    const { user_id, service_type, dentist_name, appointment_date, appointment_time, amount, branch } = req.body;
+    const {
+        user_id, userId,
+        service_type, service,
+        dentist_name, dentist,
+        appointment_date, date,
+        appointment_time, time,
+        amount, branch,
+        basePrice, base_price, price, service_price
+    } = req.body || {};
+
+    const resolvedUserId = user_id ?? userId;
+    const requestedService = service_type || service;
+    const requestedDentist = dentist_name || dentist;
+    const resolvedDate = appointment_date || date;
+    const resolvedTime = appointment_time || time;
+    const normalizedService = normalizeBookingService(requestedService);
+    const normalizedDentist = normalizeBookingDentist(requestedDentist);
+    const normalizedBranch = normalizeBookingBranch(branch || 'Main Branch');
+
+    if (!resolvedUserId || !normalizedService || !normalizedDentist || !resolvedDate || !resolvedTime) {
+        return res.status(400).json({ message: "Missing required booking information." });
+    }
+
+    const mobileStyleRequest = amount === undefined && (
+        userId !== undefined || service !== undefined || dentist !== undefined ||
+        date !== undefined || time !== undefined || basePrice !== undefined ||
+        base_price !== undefined || price !== undefined || service_price !== undefined
+    );
+    const suppliedPrice = amount ?? basePrice ?? base_price ?? price ?? service_price;
+    const amountToSave = mobileStyleRequest && webServiceBasePrices[normalizedService] !== undefined
+        ? webServiceBasePrices[normalizedService]
+        : Number(suppliedPrice ?? 0);
 
     try {
         const randomString = crypto.randomBytes(3).toString('hex').toUpperCase();
         const booking_ref = `OV - ${randomString}`;
-
-        const amountToSave = amount || 0.00;
-        const branchToSave = branch || "Main Branch";
 
         const query = `
             INSERT INTO appointments 
@@ -698,10 +925,26 @@ app.post('/api/book-appointment', async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
 
-        validateRequestedSlot(appointment_date, appointment_time);
+        validateRequestedSlot(resolvedDate, resolvedTime);
         await withAppointmentWrite(async (client) => {
-            await assertAppointmentSlotAvailable(client, appointment_date, appointment_time, dentist_name, service_type);
-            await client.query(query, [user_id, booking_ref, service_type, dentist_name, appointment_date, appointment_time, 'Pending', amountToSave, branchToSave]);
+            await assertAppointmentSlotAvailable(
+                client,
+                resolvedDate,
+                resolvedTime,
+                normalizedDentist,
+                normalizedService
+            );
+            await client.query(query, [
+                resolvedUserId,
+                booking_ref,
+                normalizedService,
+                normalizedDentist,
+                resolvedDate,
+                resolvedTime,
+                'Pending',
+                Number.isFinite(amountToSave) ? amountToSave : 0,
+                normalizedBranch
+            ]);
         });
 
         res.status(201).json({
@@ -720,6 +963,28 @@ app.get('/api/user-appointments/:userId', async (req, res) => {
         res.status(200).json(results);
     } catch (err) {
         res.status(500).json({ message: "Failed to fetch appointments." });
+    }
+});
+
+
+// Mobile compatibility alias used by BookingScreen while checking the user's own conflicts.
+app.get('/api/appointments', async (req, res) => {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ message: "User ID is required." });
+
+    try {
+        const { rows } = await db.query(
+            'SELECT * FROM appointments WHERE user_id = $1 ORDER BY appointment_date DESC',
+            [userId]
+        );
+        const mobileCompatible = rows.map((appointment) => ({
+            ...appointment,
+            service_type: mobileBookingServiceName(appointment.service_type)
+        }));
+        return res.status(200).json(mobileCompatible);
+    } catch (err) {
+        console.error("Mobile Appointments Alias Error:", err);
+        return res.status(500).json({ message: "Failed to fetch appointments." });
     }
 });
 
@@ -1056,6 +1321,78 @@ app.get('/api/appointments/check-availability', async (req, res) => {
         res.status(200).json(rows);
     } catch (err) {
         res.status(500).json({ message: 'Error checking availability' });
+    }
+});
+
+
+// Mobile compatibility alias for the same shared appointment availability data.
+app.get('/api/booked-times', async (req, res) => {
+    const { date, dentist, excludeAppointmentId } = req.query;
+    if (!date || !dentist) {
+        return res.status(400).json({ message: "Date and dentist are required." });
+    }
+
+    const normalizedDentist = normalizeBookingDentist(dentist);
+
+    try {
+        const { rows } = await db.query(
+            `SELECT appointment_time, service_type FROM appointments
+             WHERE appointment_date = $1 AND dentist_name = $2
+               AND ($3::integer IS NULL OR id <> $3)
+               AND COALESCE(status, 'Pending') NOT IN ('Cancelled', 'Canceled', 'Denied')
+             UNION ALL
+             SELECT reschedule_requested_time AS appointment_time, service_type FROM appointments
+             WHERE reschedule_requested_date = $1 AND dentist_name = $2
+               AND ($3::integer IS NULL OR id <> $3) AND status = 'Reschedule Requested'`,
+            [date, normalizedDentist, excludeAppointmentId || null]
+        );
+
+        const mobileCompatible = rows.map((appointment) => ({
+            ...appointment,
+            service_type: mobileBookingServiceName(appointment.service_type),
+            service: mobileBookingServiceName(appointment.service_type),
+            time: appointment.appointment_time
+        }));
+
+        return res.status(200).json(mobileCompatible);
+    } catch (err) {
+        console.error("Booked Times Error:", err);
+        return res.status(500).json({ message: "Error checking availability." });
+    }
+});
+
+// Mobile compatibility: patient billing summary from the same appointments table.
+app.get('/api/user-billings/:userId', async (req, res) => {
+    const { userId } = req.params;
+
+    try {
+        const { rows } = await db.query(
+            `SELECT id, service_type, amount, billing_status, appointment_date, receipt_details
+             FROM appointments
+             WHERE user_id = $1
+             ORDER BY appointment_date DESC`,
+            [userId]
+        );
+
+        const totalOutstanding = rows
+            .filter((record) => (record.billing_status || 'Pending') === 'Pending')
+            .reduce((sum, record) => sum + Number(record.amount || 0), 0);
+
+        const records = rows.map((record) => ({
+            id: record.id,
+            title: record.service_type,
+            amount: record.amount || 0,
+            status: record.billing_status || 'Pending',
+            date: new Date(record.appointment_date).toLocaleDateString('en-US', {
+                month: 'long', day: '2-digit', year: 'numeric'
+            }),
+            invoice_path: record.receipt_details
+        }));
+
+        return res.status(200).json({ records, totalOutstanding });
+    } catch (err) {
+        console.error("User Billings Error:", err);
+        return res.status(500).json({ message: "Error fetching bills" });
     }
 });
 
