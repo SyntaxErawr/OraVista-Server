@@ -1222,6 +1222,153 @@ app.post('/api/jobs/send-appointment-reminders', async (req, res) => {
     }
 });
 
+// Direct clinic rescheduling uses the same dates and start times as StaffBookingPage.
+function clinicRescheduleDates() {
+    const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+    const first = new Date(`${today}T00:00:00Z`);
+    const end = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 3, 1));
+    const dates = [];
+    for (const day = new Date(first); day < end; day.setUTCDate(day.getUTCDate() + 1)) {
+        dates.push(day.toISOString().slice(0, 10));
+    }
+    return dates;
+}
+function clinicRescheduleTimes(date) {
+    const times = ['10:00 AM', '10:30 AM', '11:00 AM', '11:30 AM', '01:00 PM',
+        '01:30 PM', '02:00 PM', '02:30 PM', '03:00 PM', '03:30 PM', '04:00 PM', '04:30 PM'];
+    if (new Date(`${date}T00:00:00Z`).getUTCDay() === 0) times.push('05:00 PM');
+    return times;
+}
+async function checkClinicRescheduleActor(actorId) {
+    if (!/^\d+$/.test(String(actorId || ''))) throw appointmentError('Please sign in as admin or staff.', 403);
+    // Legacy API identity convention: this checks a stored role, not a verified session.
+    const { rows } = await db.query('SELECT role FROM users WHERE id = $1', [actorId]);
+    if (!rows[0] || !['admin', 'staff'].includes(String(rows[0].role).toLowerCase())) {
+        throw appointmentError('Only admin and staff may reschedule appointments directly.', 403);
+    }
+}
+function checkClinicRescheduleStatus(appointment) {
+    if (!appointment) throw appointmentError('Appointment not found.', 404);
+    if (!['Confirmed', 'Late / No Show'].includes(appointment.status)) {
+        throw appointmentError('Only confirmed or late/no-show appointments can be rescheduled directly. Refresh the appointment list.', 409);
+    }
+}
+
+app.get('/api/clinic/appointments/:appointmentId/reschedule-options', async (req, res) => {
+    try {
+        await checkClinicRescheduleActor(req.query.actor_id);
+        const { rows } = await db.query(
+            `SELECT a.*, to_char(a.appointment_date, 'YYYY-MM-DD') AS original_day,
+             CONCAT(u.first_name, ' ', u.last_name) AS patient_name
+             FROM appointments a LEFT JOIN users u ON u.id = a.user_id WHERE a.id = $1`,
+            [req.params.appointmentId]
+        );
+        const appointment = rows[0];
+        checkClinicRescheduleStatus(appointment);
+        const dates = clinicRescheduleDates();
+        const selectedDate = req.query.date || (dates.includes(appointment.original_day) ? appointment.original_day : dates[0]);
+        if (!dates.includes(selectedDate)) throw appointmentError('Please choose a date from the available booking calendar.');
+        const { rows: occupied } = await db.query(
+            `SELECT appointment_time AS time, service_type FROM appointments
+             WHERE appointment_date = $1 AND dentist_name = $2 AND id <> $3
+               AND COALESCE(status, 'Pending') NOT IN ('Cancelled', 'Canceled', 'Denied')
+             UNION ALL
+             SELECT reschedule_requested_time AS time, service_type FROM appointments
+             WHERE reschedule_requested_date = $1 AND dentist_name = $2 AND id <> $3
+               AND status = 'Reschedule Requested'`,
+            [selectedDate, appointment.dentist_name, appointment.id]
+        );
+        const duration = appointmentDuration(appointment.service_type);
+        const slots = clinicRescheduleTimes(selectedDate).map(time => {
+            const start = slotMinutes(time);
+            const past = new Date(`${selectedDate}T00:00:00+08:00`).getTime() + start * 60000 <= Date.now();
+            const conflict = occupied.some(other => {
+                const otherStart = slotMinutes(other.time);
+                return otherStart === null || (start < otherStart + appointmentDuration(other.service_type) && start + duration > otherStart);
+            });
+            return { time, available: !past && !conflict, reason: past ? 'Past' : conflict ? 'Occupied' : '' };
+        });
+        res.json({
+            appointment: {
+                id: appointment.id, booking_ref: appointment.booking_ref, user_id: appointment.user_id,
+                patient_name: appointment.patient_name, branch: appointment.branch,
+                service_type: appointment.service_type, dentist_name: appointment.dentist_name,
+                appointment_date: appointment.original_day, appointment_time: appointment.appointment_time,
+                status: appointment.status, amount: appointment.amount, duration
+            },
+            dates, date: selectedDate, slots
+        });
+    } catch (err) {
+        console.error('Clinic reschedule options error:', err);
+        res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Unable to load rescheduling options. Please refresh.' });
+    }
+});
+
+app.put('/api/clinic/appointments/:appointmentId/reschedule', async (req, res) => {
+    const { actor_id, appointment_date, appointment_time, expected_status, expected_date, expected_time } = req.body || {};
+    try {
+        await checkClinicRescheduleActor(actor_id);
+        if (!expected_status || !expected_date || !expected_time) throw appointmentError('Please reopen the reschedule form before saving.', 409);
+        validateRequestedSlot(appointment_date, appointment_time);
+        if (!clinicRescheduleDates().includes(appointment_date) || !clinicRescheduleTimes(appointment_date).includes(appointment_time)) {
+            throw appointmentError('Please choose a date and time from the booking schedule.');
+        }
+        const result = await withAppointmentWrite(async client => {
+            const { rows } = await client.query(
+                `SELECT *, to_char(appointment_date, 'YYYY-MM-DD') AS original_day
+                 FROM appointments WHERE id = $1 FOR UPDATE`, [req.params.appointmentId]
+            );
+            const current = rows[0];
+            checkClinicRescheduleStatus(current);
+            if (current.status !== expected_status || current.original_day !== expected_date ||
+                slotMinutes(current.appointment_time) !== slotMinutes(expected_time)) {
+                throw appointmentError('This appointment changed while the form was open. Close the form, refresh the list, and try again.', 409);
+            }
+            if (current.original_day === appointment_date && slotMinutes(current.appointment_time) === slotMinutes(appointment_time)) {
+                throw appointmentError('Please choose a different date or time.');
+            }
+            await assertAppointmentSlotAvailable(client, appointment_date, appointment_time, current.dentist_name, current.service_type, current.id);
+            const { rows: updated } = await client.query(
+                `UPDATE appointments SET appointment_date = $1, appointment_time = $2,
+                 status = 'Confirmed', reschedule_requested_date = NULL, reschedule_requested_time = NULL,
+                 reminder_email_sent_at = NULL WHERE id = $3 RETURNING *`,
+                [appointment_date, appointment_time, current.id]
+            );
+            const { rows: patients } = await client.query('SELECT first_name, email FROM users WHERE id = $1', [current.user_id]);
+            const oldSchedule = `${formatAppointmentDate(current.original_day)} at ${appointmentTimeWithSeconds(current.appointment_time)}`;
+            const newSchedule = `${formatAppointmentDate(appointment_date)} at ${appointmentTimeWithSeconds(appointment_time)}`;
+            const amount = Number(current.amount || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const message = `The clinic has rescheduled your ${current.service_type} appointment with ${current.dentist_name}. Previous schedule: ${oldSchedule}. New schedule: ${newSchedule}. Branch: ${current.branch || 'Main Branch'}. Base price: ₱${amount}. Status: Confirmed.`;
+            await client.query(
+                `INSERT INTO notifications (user_id, appointment_id, notification_type, title, message)
+                 VALUES ($1, $2, $3, 'Appointment Rescheduled', $4)`,
+                [current.user_id, current.id, `reschedule_approved_${crypto.randomBytes(12).toString('hex')}`, message]
+            );
+            return { appointment: updated[0], patient: patients[0] || {}, message };
+        });
+        let emailSent = false;
+        try {
+            if (!result.patient.email) throw new Error('Patient email is missing.');
+            await transporter.sendMail({
+                from: process.env.EMAIL_USER, to: result.patient.email,
+                subject: 'OraVista - Appointment Rescheduled',
+                html: `<div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;"><h2>King Epres Dental Clinic</h2><p>Hello ${escapeAppointmentHtml(result.patient.first_name)},</p><p>${escapeAppointmentHtml(result.message)}</p><p>You can view your updated appointment in OraVista.</p></div>`
+            });
+            emailSent = true;
+        } catch (error) {
+            console.error('Clinic reschedule email error:', error);
+        }
+        res.json({
+            message: 'Appointment rescheduled and confirmed. The patient dashboard notification has been saved.',
+            appointment: result.appointment, email_sent: emailSent,
+            warning: emailSent ? null : 'The appointment was saved, but its email could not be sent. Please check the server email logs.'
+        });
+    } catch (err) {
+        console.error('Clinic reschedule error:', err);
+        res.status(err.statusCode || 500).json({ message: err.statusCode ? err.message : 'Unable to reschedule the appointment. Please refresh the appointment list before retrying.' });
+    }
+});
+
 // Patient reschedule requests are stored separately until staff approves them.
 app.post('/api/request-reschedule', async (req, res) => {
     const { appointment_id, user_id, requested_date, requested_time } = req.body || {};
