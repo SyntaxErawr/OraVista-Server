@@ -990,6 +990,10 @@ app.get('/api/appointments', async (req, res) => {
 
 app.put('/api/update-appointment-status', async (req, res) => {
     const { appointment_id, status, expected_status } = req.body || {};
+    // Reschedule requests must keep the original appointment and proposed schedule together.
+    if (['rescheduled', 'reschedule requested'].includes(String(status || '').trim().toLowerCase())) {
+        return res.status(400).json({ message: 'Use the reschedule request flow to change an appointment schedule. Please update the app if you are using an older version.' });
+    }
     try {
         const result = await withAppointmentWrite(async (client) => {
             const { rows } = await client.query(
