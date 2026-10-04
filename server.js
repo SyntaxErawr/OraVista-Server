@@ -31,8 +31,8 @@ app.use(cors({
         "https://oravista.site"
     ],
     credentials: true,
-    methods: ["*"],
-    allowedHeaders: ["*"]
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json());
 
@@ -150,6 +150,36 @@ const uploadRecord = multer({ storage: storage });
 // AUTHENTICATION ROUTES
 // ---------------------------------------------------------
 
+
+const {createAuth,postgresStore,strong}=require('./auth');
+const {accessControl}=require('./access-control');
+const authStore=postgresStore(db);
+const auth=createAuth({
+ store:authStore,
+ findUser:async(email,id,client)=> (await (client||db).query(email?'SELECT * FROM users WHERE LOWER(email)=$1':'SELECT * FROM users WHERE id=$1',[email||id])).rows[0],
+ compare:(value,stored)=>typeof stored==='string' && /^\$2[aby]\$/.test(stored)?bcrypt.compare(String(value),stored):Promise.resolve(false),
+ hash:value=>bcrypt.hash(value,12),
+ updatePassword:(id,password,client)=>client.query('UPDATE users SET password=$1 WHERE id=$2',[password,id]),
+ send:(email,code,purpose)=>transporter.sendMail({from:process.env.EMAIL_USER,to:email,subject:'OraVista verification code',text:`Your ${purpose.replace(/_/g,' ')} code is ${code}. It expires in 5 minutes. If you did not request it, ignore this email.`})
+});
+const authRoute=fn=>async(req,res)=>{try {res.json(await fn(req));}catch(e){console.error('Authentication request failed:',e.status||500);res.status(e.status||500).json({message:e.status?e.message:'Unable to complete verification. Please try again.'});}};
+const sessionFor=req=>auth.session((req.get('authorization')||'').replace(/^Bearer /i,''));
+app.get('/api/auth-health', (req,res)=>res.json({authentication:'server-verified-v1'}));
+app.post('/api/login',authRoute(req=>auth.login(req.body)));
+app.post('/api/send-otp',authRoute(async req=>auth.request(req.body,req.body.action==='change_password'?await sessionFor(req):null)));
+app.post('/api/forgot-password',authRoute(req=>auth.request({...req.body,action:'forgot_password'})));
+app.post('/api/verify-otp',authRoute(req=>auth.verify(req.body)));
+app.put('/api/reset-password-by-email',authRoute(req=>auth.reset(req.body)));
+app.put('/api/update-password',authRoute(async req=>auth.reset(req.body,await sessionFor(req))));
+app.use(accessControl({auth,db}));
+// Validate public registration on both client contracts, and never accept a supplied role.
+app.use(['/api/register','/api/signup'],(req,res,next)=>{
+ if(req.method!=='POST') return next();
+ const b=req.body||{};
+ if(!b.firstName?.trim() || !b.lastName?.trim() || b.firstName.trim().length>20 || b.lastName.trim().length>20 || !/^\S+@\S+\.\S+$/.test(b.email||'') || !strong(b.password) || !/^09\d{9}$/.test(b.phone||'')) return res.status(400).json({message:'Enter valid names, email, mobile number, and a strong password.'});
+ b.email=b.email.trim().toLowerCase();b.firstName=b.firstName.trim();b.lastName=b.lastName.trim();b.role='patient';next();
+});
+
 app.post('/api/signup', async (req, res) => {
     const { firstName, lastName, email, password, role, phone, dob, branch } = req.body;
 
@@ -228,83 +258,9 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/verify-otp', async (req, res) => {
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ message: "Email is required." });
 
-    try {
-        const { rows } = await db.query(
-            'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
-            [String(email).trim()]
-        );
-        if (rows.length === 0) {
-            return res.status(404).json({ message: "User not found." });
-        }
 
-        const user = { ...rows[0] };
-        delete user.password;
-        return res.status(200).json({
-            message: "Verified",
-            token: "logged_in_token",
-            user
-        });
-    } catch (err) {
-        console.error("Verify OTP Error:", err);
-        return res.status(500).json({ message: "Server error." });
-    }
-});
 
-app.post('/api/forgot-password', async (req, res) => {
-    const { email, action } = req.body || {};
-    if (!email) return res.status(400).json({ message: "Email is required." });
-
-    const cleanEmail = String(email).trim().toLowerCase();
-
-    try {
-        const { rows } = await db.query(
-            'SELECT first_name FROM users WHERE LOWER(email) = LOWER($1)',
-            [cleanEmail]
-        );
-        if (rows.length === 0) {
-            return res.status(404).json({ message: "Email not found." });
-        }
-
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        const isChange = action === 'change';
-        const emailSubject = isChange
-            ? 'OraVista - Change Password Request'
-            : 'OraVista - Forgot Password Request';
-        const emailBody = isChange
-            ? 'You requested to change your password from settings. Use this code to authorize the change.'
-            : 'Use this code to recover your account and set a new password.';
-
-        if (process.env.ENVIRONMENT === 'local') {
-            console.log(`\n[DEV MODE] Bypass active. OTP for ${cleanEmail} is: ${otp}\n`);
-        } else {
-            await transporter.sendMail({
-                from: process.env.EMAIL_USER,
-                to: cleanEmail,
-                subject: emailSubject,
-                html: `
-                    <div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;">
-                        <h2>King Epres Dental Clinic</h2>
-                        <p>Hello ${rows[0].first_name || 'Patient'},</p>
-                        <p>${emailBody}</p>
-                        <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 5px;">${otp}</h1>
-                    </div>
-                `
-            });
-        }
-
-        return res.status(200).json({
-            message: "OTP sent successfully!",
-            generatedOtp: otp
-        });
-    } catch (err) {
-        console.error("Forgot Password Error:", err);
-        return res.status(500).json({ message: "Server error." });
-    }
-});
 
 // ---------------------------------------------------------
 // ADMIN ROUTE: CREATE STAFF OR DENTIST
@@ -338,68 +294,7 @@ app.post('/api/admin/create-user', async (req, res) => {
     }
 });
 
-app.post('/api/login', async (req, res) => {
-    const { email, password } = req.body;
 
-    try {
-        // 1. Fetch User
-        const { rows: users } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
-
-        // Log for debugging: See if the email even exists in the DB
-        console.log(`Login attempt for: ${email}`);
-
-        if (users.length === 0) {
-            console.log("❌ Error: Email not found in database.");
-            return res.status(401).json({ message: "Invalid email or password." });
-        }
-
-        const user = users[0];
-
-        // 2. Handle Plain-Text Seed Data (ID 81-86)
-        // If the DB password isn't a valid bcrypt hash (starts with $2b$), 
-        // we do a direct string comparison for your dummy data.
-        let isMatch = false;
-        if (!user.password.startsWith('$2b$')) {
-            console.log("⚠️ Warning: Non-bcrypt password detected in DB. Using direct match.");
-            isMatch = (password === user.password);
-        } else {
-            // 3. Normal Bcrypt Comparison
-            isMatch = await bcrypt.compare(password, user.password);
-        }
-
-        if (!isMatch) {
-            console.log("❌ Error: Password mismatch.");
-            return res.status(401).json({ message: "Invalid email or password." });
-        }
-
-        console.log("✅ Success: Login verified for", user.role);
-
-        // 4. Successful Response
-        res.status(200).json({
-            message: "Login successful",
-            user: {
-                id: user.id,
-                firstName: user.first_name,
-                lastName: user.last_name,
-                email: user.email,
-                sex: user.sex ?? "",
-                dob: user.dob instanceof Date
-                    ? `${user.dob.getFullYear()}-${String(user.dob.getMonth() + 1).padStart(2, "0")}-${String(user.dob.getDate()).padStart(2, "0")}`
-                    : (user.dob ? String(user.dob).slice(0, 10) : ""),
-                age: user.age ?? "",
-                phone: user.phone ?? "",
-                occupation: user.occupation ?? "",
-                role: user.role,
-                branch: user.branch || "",
-                profile_picture: user.profile_picture || ""
-            }
-        });
-
-    } catch (err) {
-        console.error("🔥 Server Error:", err);
-        res.status(500).json({ message: "Server error." });
-    }
-});
 
 app.post('/api/check-email', async (req, res) => {
     const { email } = req.body;
@@ -412,80 +307,12 @@ app.post('/api/check-email', async (req, res) => {
     }
 });
 
-app.put('/api/reset-password-by-email', async (req, res) => {
-    const { email, newPassword } = req.body;
-    try {
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await db.query('UPDATE users SET password = $1 WHERE email = $2', [hashedPassword, email]);
-        res.status(200).json({ message: "Password updated successfully!" });
-    } catch (err) {
-        res.status(500).json({ message: "Server error." });
-    }
-});
+
 
 // ---------------------------------------------------------
 // OTP / DYNAMIC EMAIL ROUTE
 // ---------------------------------------------------------
-app.post('/api/send-otp', async (req, res) => {
-    const { email, action } = req.body;
 
-    try {
-        const { rows: users } = await db.query('SELECT first_name FROM users WHERE email = $1', [email]);
-        if (users.length === 0) {
-            return res.status(404).json({ message: "Email not found in our system." });
-        }
-
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-        let emailSubject = '';
-        let emailBodyContext = '';
-
-        if (action === 'change_password') {
-            emailSubject = 'OraVista - Change Password Request';
-            emailBodyContext = 'This is a change password request. You have initiated a request to change your current password from within your account settings. To authorize and confirm this security change, please use the code below.';
-        } else if (action === 'login') {
-            emailSubject = 'OraVista - Login Verification';
-            emailBodyContext = 'This is a login verification. A new sign-in attempt was detected for your OraVista account. To verify your identity and complete the login process, please enter the security code below.';
-        } else if (action === 'forgot_password') {
-            emailSubject = 'OraVista - Forgot Password Request';
-            emailBodyContext = 'This is a forgot password request. We received a request to recover your OraVista account because you forgot your password. Please use the verification code below to gain access and set a new password.';
-        } else {
-            emailSubject = 'OraVista - Forgot Password Request';
-            emailBodyContext = 'This is a forgot password request. We received a request to reset the password for your account. Please use the verification code below to proceed.';
-        }
-
-        const mailOptions = {
-            from: process.env.EMAIL_USER,
-            to: email,
-            subject: emailSubject,
-            html: `
-                <div style="font-family: Arial, sans-serif; padding: 20px; color: #001166;">
-                    <h2>King Epres Dental Clinic</h2>
-                    <p>Hello ${users[0].first_name},</p>
-                    <p>${emailBodyContext}</p>
-                    <h1 style="background: #f4f4f4; padding: 10px; display: inline-block; letter-spacing: 5px;">${otp}</h1>
-                    <p>This code will expire shortly.</p>
-                    <p>If you did not initiate this request, please secure your account immediately and ignore this email.</p>
-                </div>
-            `
-        };
-
-        // Check if the system is running in development mode
-        if (process.env.ENVIRONMENT === 'local') {
-            console.log(`\n[DEV MODE] Bypass active. OTP for ${email} is: ${otp}\n`);
-        } else {
-            // Live email delivery for dev and production
-            await transporter.sendMail(mailOptions);
-        }
-
-        res.status(200).json({ message: "OTP sent successfully!", generatedOtp: otp });
-
-    } catch (err) {
-        console.error("Email Error:", err);
-        res.status(500).json({ message: "Failed to send email." });
-    }
-});
 
 // ---------------------------------------------------------
 // PROFILE & SETTINGS ROUTES
@@ -537,23 +364,11 @@ app.put('/api/update-profile', async (req, res) => {
     }
 });
 
-app.put('/api/update-password', async (req, res) => {
-    const { id, oldPassword, newPassword } = req.body;
-    try {
-        const { rows: users } = await db.query('SELECT password FROM users WHERE id = $1', [id]);
-        const isMatch = await bcrypt.compare(oldPassword, users[0].password);
-        if (!isMatch) return res.status(401).json({ message: "Incorrect old password." });
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(newPassword, salt);
-        await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, id]);
-        res.status(200).json({ message: "Password updated successfully!" });
-    } catch (err) {
-        res.status(500).json({ message: "Server error." });
-    }
-});
+
 
 app.post('/api/upload-profile-picture', upload.single('profileImage'), async (req, res) => {
     const { userId } = req.body;
+    if (String(userId)!==String(req.actor.id)) return res.status(403).json({message:'Profile access denied.'});
 
     if (!req.file) {
         return res.status(400).json({ message: "No image file provided." });
@@ -1785,6 +1600,6 @@ app.post('/api/save-diagnosis', async (req, res) => {
 // START SERVER
 // ---------------------------------------------------------
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+authStore.initialize().then(() => app.listen(PORT, () => {
     console.log(`OraVista Backend running on http://localhost:${PORT}`);
-});
+})).catch(error => { console.error('Authentication storage initialization failed. Check database permissions.', error.message); process.exitCode=1; db.end(); });
