@@ -6,6 +6,7 @@ test('approved balances account for partial payments and paid bills have no bala
  assert.deepEqual(amounts(bill), {charge:1000,paid:250,balance:750});
  assert.equal(amounts({...bill,billing_status:'Paid'}).balance,0);
  assert.equal(isPublished({...bill,billing_status:'Denied'}),false);
+ assert.equal(isPublished({...bill,billing_status:'Pending'}),false);
  assert.equal(isPublished({...bill,billing_status:null}),false);
  assert.equal(amounts({...bill,receipt_details:'{"paid":100}'}).balance,900);
 });

@@ -11,7 +11,7 @@ const {createRequire} = require('node:module');
 test('server HTTP authentication contracts', async t => {
   const user = {id:7,email:'patient@example.test',password:await bcrypt.hash('OldPassword1!',4),role:'patient',first_name:'Test'};
   const states = new Map(), mail = [];
-  const bills = ['Approved','Paid','Denied',null].map((status,i)=>({id:i+1,user_id:7,service_type:'Cleaning',amount:1000,billing_status:status,appointment_date:'2026-10-05',receipt_details:{paid:250}}));
+  const bills = ['Approved','Paid','Denied',null,'Pending'].map((status,i)=>({id:i+1,user_id:7,service_type:'Cleaning',amount:1000,billing_status:status,appointment_date:'2026-10-05',receipt_details:{paid:250}}));
   const db = {
     async query(sql, args=[]) {
       if(sql.startsWith('SELECT data FROM auth_state')) return {rows:states.has(args[0])?[{data:structuredClone(states.get(args[0]))}]:[]};
@@ -67,7 +67,7 @@ test('server HTTP authentication contracts', async t => {
   await t.test('mobile billing hides unpublished/denied bills, maps approval and survives storage failure',async()=>{
     const response=await request('/api/user-billings/7',null,session,'GET');
     assert.equal(response.status,200);const data=await response.json();
-    assert.equal(data.records.length,2);assert.equal(data.records[0].status,'Pending');
+    assert.equal(data.records.length,3);assert.equal(data.records[0].status,'Approved');
     assert.equal(data.totalOutstanding,750);assert.equal(data.records[0].invoice_path,null);
     assert.equal((await request('/api/user-billings/8',null,session,'GET')).status,403);
   });

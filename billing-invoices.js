@@ -12,7 +12,7 @@ function amounts(record) {
   const paid = record.billing_status === 'Paid' ? charge : Math.min(charge, money(details.paid));
   return { charge, paid, balance: Math.round((charge - paid) * 100) / 100 };
 }
-const isPublished = record => ['Pending', 'Approved', 'Paid'].includes(record.billing_status);
+const isPublished = record => ['Approved', 'Paid'].includes(record.billing_status);
 function createPDF(record) {
   const doc = new jsPDF();
   const totals = amounts(record), details = receiptObject(record.receipt_details);

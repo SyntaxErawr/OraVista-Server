@@ -1362,8 +1362,8 @@ app.get('/api/user-billings/:userId', async (req, res) => {
             [userId]
         );
 
-        const published = rows.filter(isPublished);
-        const totalOutstanding = Math.round(published.reduce((sum, record) => sum + amounts(record).balance, 0) * 100) / 100;
+        const published = rows.filter(record => ['Pending', 'Approved', 'Paid'].includes(record.billing_status));
+        const totalOutstanding = Math.round(published.reduce((sum, record) => sum + (isPublished(record) ? amounts(record).balance : 0), 0) * 100) / 100;
         const records = [];
         // Sequential work bounds storage requests even for long billing histories.
         for (const record of published) {
@@ -1374,7 +1374,7 @@ app.get('/api/user-billings/:userId', async (req, res) => {
                 id: record.id,
                 title: record.service_type,
                 amount: amounts(record).charge,
-                status: record.billing_status === 'Approved' ? 'Pending' : record.billing_status,
+                status: record.billing_status,
                 date: new Date(record.appointment_date).toLocaleDateString('en-US', {
                     month: 'long', day: '2-digit', year: 'numeric'
                 }),
