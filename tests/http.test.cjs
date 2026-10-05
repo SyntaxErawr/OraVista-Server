@@ -67,4 +67,20 @@ test('server HTTP authentication contracts', async t => {
   await t.test('registration rejects invalid fields before inserting a user',async()=>{
     const r=await request('/api/register',{firstName:'Test',lastName:'Patient',email:'bad',phone:'1',password:'short',role:'admin'});assert.equal(r.status,400);
   });
+  for(const route of ['/api/signup','/api/register']) {
+    await t.test(route+' reports separate errors and rejects malformed field types',async()=>{
+      const r=await request(route,{firstName:{},lastName:[],email:'bad',phone:'1',password:'short'});
+      assert.equal(r.status,400);const data=await r.json();
+      assert.deepEqual(Object.keys(data.errors).sort(),['email','firstName','lastName','password','phone']);
+    });
+    await t.test(route+' accepts complete patient registration',async()=>{
+      const r=await request(route,{firstName:'ABCDEFGHIJKLMNOPQRST',lastName:'Patient',email:' new@example.test ',phone:' 09123456789 ',password:'StrongPassword1!',role:'admin'});
+      assert.equal(r.status,201);
+    });
+    await t.test(route+' attaches duplicate email errors to email',async()=>{
+      const r=await request(route,{firstName:'Test',lastName:'Patient',email:user.email,phone:'09123456789',password:'StrongPassword1!'});
+      assert.equal(r.status,400);assert.match((await r.json()).errors.email,/already registered/);
+    });
+  }
+
 });

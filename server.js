@@ -176,8 +176,18 @@ app.use(accessControl({auth,db}));
 app.use(['/api/register','/api/signup'],(req,res,next)=>{
  if(req.method!=='POST') return next();
  const b=req.body||{};
- if(!b.firstName?.trim() || !b.lastName?.trim() || b.firstName.trim().length>20 || b.lastName.trim().length>20 || !/^\S+@\S+\.\S+$/.test(b.email||'') || !strong(b.password) || !/^09\d{9}$/.test(b.phone||'')) return res.status(400).json({message:'Enter valid names, email, mobile number, and a strong password.'});
- b.email=b.email.trim().toLowerCase();b.firstName=b.firstName.trim();b.lastName=b.lastName.trim();b.role='patient';next();
+ const errors={};
+ for(const field of ['firstName','lastName']) {
+   if(typeof b[field]!=='string' || !b[field].trim()) errors[field]='This field is required.';
+   else if(b[field].trim().length>20) errors[field]='Use 20 characters or fewer.';
+ }
+ if(typeof b.email!=='string' || !b.email.trim()) errors.email='This field is required.';
+ else if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(b.email.trim())) errors.email='Enter a valid email address.';
+ if(typeof b.phone!=='string' || !b.phone.trim()) errors.phone='This field is required.';
+ else if(!/^09\d{9}$/.test(b.phone.trim())) errors.phone='Enter an 11-digit mobile number starting with 09.';
+ if(!strong(b.password)) errors.password='Use 8-128 characters with uppercase, lowercase, number and symbol.';
+ if(Object.keys(errors).length) return res.status(400).json({message:Object.values(errors)[0],errors});
+ b.email=b.email.trim().toLowerCase();b.firstName=b.firstName.trim();b.lastName=b.lastName.trim();b.phone=b.phone.trim();b.role='patient';next();
 });
 
 app.post('/api/signup', async (req, res) => {
@@ -192,9 +202,9 @@ app.post('/api/signup', async (req, res) => {
     }
 
     try {
-        const { rows: existingUser } = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+        const { rows: existingUser } = await db.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [email]);
         if (existingUser.length > 0) {
-            return res.status(400).json({ message: "Email already registered." });
+            return res.status(400).json({ message: "Email already registered.", errors: { email: "Email already registered." } });
         }
 
         const salt = await bcrypt.genSalt(10);
@@ -237,7 +247,7 @@ app.post('/api/register', async (req, res) => {
             [cleanEmail]
         );
         if (existingUser.length > 0) {
-            return res.status(400).json({ message: "Email is already registered." });
+            return res.status(400).json({ message: "Email is already registered.", errors: { email: "Email is already registered." } });
         }
 
         const salt = await bcrypt.genSalt(10);
