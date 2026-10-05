@@ -10,6 +10,7 @@ const fs = require('fs');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
+const { createInvoiceService, amounts, isPublished, receiptObject } = require('./billing-invoices');
 const app = express();
 
 let supabase = null;
@@ -21,6 +22,8 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
 } else {
     console.warn("⚠️ Warning: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing. Supabase Storage uploads will fail.");
 }
+
+const invoiceUrl = createInvoiceService(supabase);
 
 app.use(cors({
     origin: [
@@ -1258,6 +1261,15 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
         return res.status(400).json({ message: 'Invalid billing status.' });
     }
 
+    const details = receiptObject(receipt_details);
+    const charge = Number(amount), paid = Number(details.paid || 0);
+    if (amount === '' || amount == null || !Number.isFinite(charge) || charge < 0 ||
+        !Number.isFinite(paid) || paid < 0 || paid > charge ||
+        typeof service_type !== 'string' || !service_type.trim() ||
+        (billing_status === 'Paid' && paid !== charge)) {
+        return res.status(400).json({ message: 'Enter a valid charge, payment and service. Paid bills require full payment.' });
+    }
+    const normalizedReceipt = { ...details, procedure: service_type.trim(), charge: charge.toFixed(2), paid: paid.toFixed(2), balance: (charge - paid).toFixed(2) };
     try {
         const { rows } = await db.query(
             `UPDATE appointments
@@ -1267,7 +1279,7 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
                  receipt_details = $4::jsonb
              WHERE id = $5
              RETURNING *`,
-            [billing_status, Number(amount) || 0, service_type, JSON.stringify(receipt_details || {}), appointmentId]
+            [billing_status, charge, service_type.trim(), JSON.stringify(normalizedReceipt), appointmentId]
         );
 
         if (rows.length === 0) {
@@ -1343,27 +1355,33 @@ app.get('/api/user-billings/:userId', async (req, res) => {
 
     try {
         const { rows } = await db.query(
-            `SELECT id, service_type, amount, billing_status, appointment_date, receipt_details
-             FROM appointments
-             WHERE user_id = $1
-             ORDER BY appointment_date DESC`,
+            `SELECT a.id, a.user_id, a.booking_ref, a.service_type, a.amount, a.billing_status, a.appointment_date, a.receipt_details, u.first_name, u.last_name
+             FROM appointments a JOIN users u ON u.id = a.user_id
+             WHERE a.user_id = $1
+             ORDER BY a.appointment_date DESC, a.id DESC`,
             [userId]
         );
 
-        const totalOutstanding = rows
-            .filter((record) => (record.billing_status || 'Pending') === 'Pending')
-            .reduce((sum, record) => sum + Number(record.amount || 0), 0);
-
-        const records = rows.map((record) => ({
-            id: record.id,
-            title: record.service_type,
-            amount: record.amount || 0,
-            status: record.billing_status || 'Pending',
-            date: new Date(record.appointment_date).toLocaleDateString('en-US', {
-                month: 'long', day: '2-digit', year: 'numeric'
-            }),
-            invoice_path: record.receipt_details
-        }));
+        const published = rows.filter(isPublished);
+        const totalOutstanding = Math.round(published.reduce((sum, record) => sum + amounts(record).balance, 0) * 100) / 100;
+        const records = [];
+        // Sequential work bounds storage requests even for long billing histories.
+        for (const record of published) {
+            let invoice_path = null;
+            try { invoice_path = await invoiceUrl(record); }
+            catch (error) { console.error('Invoice generation failed for bill', record.id, error.message); }
+            records.push({
+                id: record.id,
+                title: record.service_type,
+                amount: amounts(record).charge,
+                status: record.billing_status === 'Approved' ? 'Pending' : record.billing_status,
+                date: new Date(record.appointment_date).toLocaleDateString('en-US', {
+                    month: 'long', day: '2-digit', year: 'numeric'
+                }),
+                invoice_path,
+                invoice_available: Boolean(invoice_path),
+            });
+        }
 
         return res.status(200).json({ records, totalOutstanding });
     } catch (err) {
