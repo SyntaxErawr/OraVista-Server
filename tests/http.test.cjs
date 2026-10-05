@@ -68,7 +68,7 @@ test('server HTTP authentication contracts', async t => {
     const response=await request('/api/user-billings/7',null,session,'GET');
     assert.equal(response.status,200);const data=await response.json();
     assert.equal(data.records.length,3);assert.equal(data.records[0].status,'Approved');
-    assert.equal(data.totalOutstanding,750);assert.equal(data.records[0].invoice_path,null);
+    assert.equal(data.totalOutstanding,750);assert.equal(data.records[0].paid,250);assert.equal(data.records[0].balance,750);assert.equal(data.records[1].balance,0);assert.equal(data.records[0].invoice_path,null);
     assert.equal((await request('/api/user-billings/8',null,session,'GET')).status,403);
   });
   await t.test('clinic billing rejects overpayments and recomputes saved balance',async()=>{

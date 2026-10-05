@@ -1374,6 +1374,8 @@ app.get('/api/user-billings/:userId', async (req, res) => {
                 id: record.id,
                 title: record.service_type,
                 amount: amounts(record).charge,
+                paid: amounts(record).paid,
+                balance: amounts(record).balance,
                 status: record.billing_status,
                 date: new Date(record.appointment_date).toLocaleDateString('en-US', {
                     month: 'long', day: '2-digit', year: 'numeric'
