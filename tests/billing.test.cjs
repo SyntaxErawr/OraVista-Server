@@ -37,3 +37,21 @@ test('public bucket and failed storage do not expose invoices', async () => {
 test('legacy explicit HTTPS invoice links remain supported', async () => {
  assert.equal(await createInvoiceService(null)({...bill,receipt_details:'https://example.test/upload.pdf'}),'https://example.test/upload.pdf');
 });
+
+test('missing bucket with HTTP 400 and storage 404 creates private storage then generates invoice', async () => {
+ let created=false,uploaded=false;
+ const service=createInvoiceService({storage:{
+  getBucket:async()=>({data:null,error:{status:400,statusCode:'404',message:'Bucket not found'}}),
+  createBucket:async(name,options)=>{assert.equal(name,'billing-invoices');assert.equal(options.public,false);created=true;return {data:{name}};},
+  from:()=>({
+   createSignedUrl:async()=>uploaded?{data:{signedUrl:'https://test/invoice.pdf'}}:{error:{status:400,message:'Object not found'}},
+   upload:async(path,pdf)=>{assert.equal(created,true);assert.match(pdf.toString(),/^%PDF/);uploaded=true;return {};}
+  })
+ }});
+ assert.equal(await service(bill),'https://test/invoice.pdf');assert.equal(uploaded,true);
+});
+test('permission errors never trigger bucket creation', async()=>{
+ let created=false;
+ const service=createInvoiceService({storage:{getBucket:async()=>({error:{status:403,message:'Forbidden'}}),createBucket:async()=>{created=true;return {};}}});
+ await assert.rejects(service(bill));assert.equal(created,false);
+});

@@ -47,7 +47,8 @@ function createInvoiceService(supabase) {
     if (!supabase) throw new Error('Invoice storage is not configured.');
     if (!ready) ready = (async () => {
       let { data, error } = await supabase.storage.getBucket(BUCKET);
-      if (error && String(error.status || error.statusCode) !== '404') throw error;
+      const missingBucket = error && (String(error.statusCode) === '404' || String(error.status) === '404' || error.code === 'NoSuchBucket' || /^(bucket not found|the resource was not found)\.?$/i.test(error.message || ''));
+      if (error && !missingBucket) throw error;
       if (!data) {
         const created = await supabase.storage.createBucket(BUCKET, { public: false });
         if (created.error) {
