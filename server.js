@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { registerDiagnosticRecords } = require('./diagnosticRecords');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 
@@ -421,6 +422,8 @@ app.post('/api/upload-profile-picture', upload.single('profileImage'), async (re
 // ---------------------------------------------------------
 // PATIENT RECORDS ROUTES
 // ---------------------------------------------------------
+
+registerDiagnosticRecords(app, { db, supabase });
 
 app.post('/api/upload-record', uploadRecord.single('recordFile'), async (req, res) => {
     const { userId, fileName } = req.body;
