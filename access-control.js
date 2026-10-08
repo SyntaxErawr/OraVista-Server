@@ -7,6 +7,7 @@ function accessControl({auth,db}) {
   try {
    req.actor=await auth.session((req.get('authorization')||'').replace(/^Bearer /i,''));
    const role=String(req.actor.role).toLowerCase();
+   if(['/api/admin/transactions','/api/admin/audit-logs'].includes(p) && role!=='admin') return res.status(403).json({message:'Administrator access required.'});
    if(['admin','staff','dentist'].includes(role)) {
     if(p==='/api/admin/create-user' && role!=='admin') return res.status(403).json({message:'Administrator access required.'});
     if(req.body?.actor_id && String(req.body.actor_id)!==String(req.actor.id)) return res.status(403).json({message:'Account mismatch.'});

@@ -166,7 +166,9 @@ const auth=createAuth({
  updatePassword:(id,password,client)=>client.query('UPDATE users SET password=$1 WHERE id=$2',[password,id]),
  send:(email,code,purpose)=>transporter.sendMail({from:process.env.EMAIL_USER,to:email,subject:'OraVista verification code',text:`Your ${purpose.replace(/_/g,' ')} code is ${code}. It expires in 5 minutes. If you did not request it, ignore this email.`})
 });
-const authRoute=fn=>async(req,res)=>{try {res.json(await fn(req));}catch(e){console.error('Authentication request failed:',e.status||500);res.status(e.status||500).json({message:e.status?e.message:'Unable to complete verification. Please try again.'});}};
+const { installOversight, paymentDelta } = require('./oversight');
+const oversight = installOversight(app, db);
+const authRoute=fn=>async(req,res)=>{try {const result=await fn(req);await oversight.recordAuth(req,result?.user || req.actor,true);res.json(result);}catch(e){console.error('Authentication request failed:',e.status||500);try {await oversight.recordAuth(req,req.actor,false);}catch(logError){console.error('Authentication audit failed:',logError.message);}res.status(e.status||500).json({message:e.status?e.message:'Unable to complete verification. Please try again.'});}};
 const sessionFor=req=>auth.session((req.get('authorization')||'').replace(/^Bearer /i,''));
 app.get('/api/auth-health', (req,res)=>res.json({authentication:'server-verified-v1'}));
 app.post('/api/login',authRoute(req=>auth.login(req.body)));
@@ -176,6 +178,13 @@ app.post('/api/verify-otp',authRoute(req=>auth.verify(req.body)));
 app.put('/api/reset-password-by-email',authRoute(req=>auth.reset(req.body)));
 app.put('/api/update-password',authRoute(async req=>auth.reset(req.body,await sessionFor(req))));
 app.use(accessControl({auth,db}));
+oversight.registerRoutes();
+app.use(async (req, res, next) => {
+    if (['/api/signup', '/api/register'].includes(req.path) && req.get('authorization')) {
+        try { req.actor = await sessionFor(req); } catch (error) { return res.status(401).json({ message: 'Please sign in again.' }); }
+    }
+    next();
+});
 // Validate public registration on both client contracts, and never accept a supplied role.
 app.use(['/api/register','/api/signup'],(req,res,next)=>{
  if(req.method!=='POST') return next();
@@ -1273,8 +1282,24 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
         return res.status(400).json({ message: 'Enter a valid charge, payment and service. Paid bills require full payment.' });
     }
     const normalizedReceipt = { ...details, procedure: service_type.trim(), charge: charge.toFixed(2), paid: paid.toFixed(2), balance: (charge - paid).toFixed(2) };
+    if (!['admin', 'staff'].includes(req.actor?.role)) return res.status(403).json({ message: 'Only admin or staff can record payments.' });
+    let client;
     try {
-        const { rows } = await db.query(
+        client = await db.connect();
+        await client.query('BEGIN');
+        const existing = await client.query('SELECT * FROM appointments WHERE id = $1 FOR UPDATE', [appointmentId]);
+        if (!existing.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Appointment not found.' }); }
+        const old = existing.rows[0];
+        const previousPaid = amounts(old).paid;
+        if (req.body.expected_paid != null && Math.round(Number(req.body.expected_paid) * 100) !== Math.round(previousPaid * 100)) throw Object.assign(new Error('This bill was changed by another user. Reload the bill before recording payment.'), { status: 409 });
+        const delta = paymentDelta(previousPaid, paid, details.paymentMethod, details.paymentReference);
+        if (billing_status === 'Denied' && paid > 0) throw Object.assign(new Error('A bill with recorded payments cannot be denied.'), { status: 400 });
+        if (delta > 0) {
+            const patient = await client.query('SELECT first_name, last_name FROM users WHERE id = $1', [old.user_id]);
+            const name = [patient.rows[0]?.first_name, patient.rows[0]?.last_name].filter(Boolean).join(' ');
+            await client.query('INSERT INTO payment_events(appointment_id, patient_name, booking_ref, branch, service, amount, method, reference, collector_id, collector_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [old.id, name, old.booking_ref, old.branch, service_type.trim(), delta, details.paymentMethod, String(details.paymentReference || '').trim().slice(0,200), String(req.actor.id), [req.actor.first_name || req.actor.firstName,req.actor.last_name || req.actor.lastName].filter(Boolean).join(' ')]);
+        }
+        const { rows } = await client.query(
             `UPDATE appointments
              SET billing_status = $1,
                  amount = $2,
@@ -1284,14 +1309,18 @@ app.put('/api/staff/billings/:appointmentId', async (req, res) => {
              RETURNING *`,
             [billing_status, charge, service_type.trim(), JSON.stringify(normalizedReceipt), appointmentId]
         );
+        await client.query('COMMIT');
 
         if (rows.length === 0) {
             return res.status(404).json({ message: 'Appointment not found.' });
         }
         res.status(200).json({ message: `Billing marked as ${billing_status}.`, appointment: rows[0] });
     } catch (err) {
+        if (client) await client.query('ROLLBACK');
         console.error('Staff billing update error:', err);
-        res.status(500).json({ message: 'Failed to update billing record.' });
+        res.status(err.status || 500).json({ message: err.status ? err.message : 'Failed to update billing record.' });
+    } finally {
+        if (client) client.release();
     }
 });
 
@@ -1446,9 +1475,9 @@ app.get('/api/dashboard/stats', async (req, res) => {
 app.get('/api/dashboard/branch-earnings', async (req, res) => {
     try {
         const query = `
-            SELECT branch, SUM(amount) as total_earnings 
-            FROM appointments 
-            WHERE status != 'Cancelled'
+            SELECT branch, SUM(amount) as total_earnings
+            FROM payment_events
+            WHERE (created_at AT TIME ZONE 'Asia/Manila')::date = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Manila')::date
             GROUP BY branch
         `;
         const { rows: results } = await db.query(query);
@@ -1648,6 +1677,6 @@ app.post('/api/save-diagnosis', async (req, res) => {
 // START SERVER
 // ---------------------------------------------------------
 const PORT = process.env.PORT || 5000;
-authStore.initialize().then(() => app.listen(PORT, () => {
+authStore.initialize().then(() => oversight.initialize()).then(() => app.listen(PORT, () => {
     console.log(`OraVista Backend running on http://localhost:${PORT}`);
-})).catch(error => { console.error('Authentication storage initialization failed. Check database permissions.', error.message); process.exitCode=1; db.end(); });
+})).catch(error => { console.error('Authentication or oversight storage initialization failed. Check database migration permissions.', error.message); process.exitCode=1; db.end(); });
