@@ -1407,7 +1407,8 @@ app.get('/api/dashboard/stats', async (req, res) => {
         const { rows: monthPatientsRows } = await db.query(`SELECT COUNT(DISTINCT user_id) as count FROM appointments WHERE EXTRACT(MONTH FROM appointment_date) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM appointment_date) = EXTRACT(YEAR FROM CURRENT_DATE)`);
 
         const { rows: scheduleRows } = await db.query(`
-            SELECT a.id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type, a.created_at,
+            SELECT a.id, a.user_id, a.booking_ref, a.appointment_time, a.appointment_date, a.dentist_name, a.status, a.service_type, a.created_at,
+            to_char(a.appointment_date, 'YYYY-MM-DD') AS growth_date,
             to_char(a.reschedule_requested_date, 'YYYY-MM-DD') AS requested_date, a.reschedule_requested_time,
             CONCAT(u.first_name, ' ', u.last_name) as patient_name
             FROM appointments a
@@ -1423,6 +1424,8 @@ app.get('/api/dashboard/stats', async (req, res) => {
             schedule: scheduleRows.map(row => ({
                 id: row.id,
                 booking_ref: row.booking_ref,
+                patientId: row.user_id,
+                growthDate: row.growth_date,
                 time: row.appointment_time,
                 date: row.appointment_date,
                 dentist: row.dentist_name,
@@ -1518,6 +1521,18 @@ app.get('/api/patients', async (req, res) => {
         res.status(200).json(patients);
     } catch (err) {
         res.status(500).json({ message: "Failed to fetch patients list." });
+    }
+});
+
+app.get('/api/admin/dentists', async (req, res) => {
+    try {
+        const { buildDentistDirectory } = require('./dentist-directory');
+        const { rows: users } = await db.query("SELECT id, first_name, last_name, specialty, status, branch FROM users WHERE role = 'dentist' ORDER BY last_name, first_name, id");
+        const { rows: appointments } = await db.query("SELECT dentist_name, user_id, branch, status, to_char(appointment_date, 'YYYY-MM-DD') AS date, to_char(CURRENT_DATE, 'YYYY-MM-DD') AS today FROM appointments ORDER BY id");
+        res.json(buildDentistDirectory(users, appointments, appointments[0]?.today));
+    } catch (err) {
+        console.error('Admin dentist directory error:', err);
+        res.status(500).json({ message: 'Failed to fetch dentists list.' });
     }
 });
 
