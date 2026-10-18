@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const { profileAge, profileSex } = require('./profile-fields');
 const { registerDiagnosticRecords } = require('./diagnosticRecords');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
@@ -357,6 +358,9 @@ app.get('/api/user-profile', async (req, res) => {
 
         const user = { ...rows[0] };
         delete user.password;
+        user.age = profileAge(user.dob);
+        user.sex = profileSex(user.sex);
+        res.set('Cache-Control', 'no-store');
         return res.status(200).json(user);
     } catch (err) {
         console.error("User Profile Error:", err);
@@ -372,10 +376,22 @@ app.put('/api/update-profile', async (req, res) => {
         blood_type: 'blood_type', allergies: 'allergies', insurance: 'insurance', policy_number: 'policy_number'
     };
     // Update only supplied fields. A web information save must not erase medical data or the photo.
-    const fields = Object.keys(columns).filter(key => Object.hasOwn(req.body, key));
+    const input = { ...req.body };
+    delete input.age; // Age cannot be edited independently of a birth date.
+    if (Object.hasOwn(input, 'dob')) {
+        input.dob = input.dob || null;
+        input.age = profileAge(input.dob);
+        if (input.dob && (typeof input.dob !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(input.dob) || input.age === null)) return res.status(400).json({ message: 'Enter a valid birth date that is not in the future.' });
+    }
+    if (Object.hasOwn(input, 'sex')) {
+        const normalized = profileSex(input.sex);
+        if (input.sex && !normalized) return res.status(400).json({ message: 'Select Male or Female, or leave sex blank.' });
+        input.sex = normalized || null;
+    }
+    const fields = Object.keys(columns).filter(key => Object.hasOwn(input, key));
     if (!id || !fields.length) return res.status(400).json({ message: 'Provide a patient and profile changes.' });
     const values = fields.map(key => {
-        const value = req.body[key];
+        const value = input[key];
         if ((key === 'dob' || key === 'age') && value === '') return null;
         return typeof value === 'string' ? value.trim() : value;
     });
@@ -385,6 +401,8 @@ app.put('/api/update-profile', async (req, res) => {
         if (!rows.length) return res.status(404).json({ message: 'Patient profile not found.' });
         const user = { ...rows[0] };
         delete user.password;
+        user.age = profileAge(user.dob);
+        user.sex = profileSex(user.sex);
         res.status(200).json({ message: 'Profile updated successfully!', user });
     } catch (err) {
         console.error('Database Update Error:', err);

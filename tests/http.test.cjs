@@ -21,6 +21,7 @@ test('server HTTP authentication contracts', async t => {
       if(sql.includes('INSERT INTO payment_events')) { payments.push(args); return {rows:[]}; }
       if(sql.includes('SET billing_status')) { Object.assign(bills[0], {billing_status:args[0],amount:args[1],receipt_details:JSON.parse(args[3])}); return {rows:[{...bills[0]}]}; }
       if(sql.includes('FROM users')) return {rows:args[0]===user.email || String(args[0])===String(user.id)?[{...user}]:[]};
+      if(sql.startsWith('UPDATE users SET profile_picture')) { user.profile_picture=args[0]; return {rows:[]}; }
       if(sql.startsWith('UPDATE users SET password')) {user.password=args[0];return {rows:[]};}
       if (sql.startsWith('UPDATE users SET ') && sql.includes(' RETURNING *')) {
         if (String(args.at(-1)) !== String(user.id)) return { rows: [] };
@@ -43,11 +44,11 @@ test('server HTTP authentication contracts', async t => {
     };
     Object.assign(factory,express);
     const filename=path.join(__dirname,'../server.js'), realRequire=createRequire(filename);
-    const stubs={express:factory,pg:{Pool:class {constructor(){return db;}}},nodemailer:{createTransport:()=>({sendMail:async message=>mail.push(message)})},dotenv:{config(){}},fs:{...fs,existsSync:()=>true}};
+    const stubs={express:factory,pg:{Pool:class {constructor(){return db;}}},nodemailer:{createTransport:()=>({sendMail:async message=>mail.push(message)})},dotenv:{config(){}},'@supabase/supabase-js':{createClient:()=>({storage:{from:()=>({upload:async()=>({data:{},error:null})})}})},fs:{...fs,existsSync:()=>true}};
     try {
       vm.runInNewContext(fs.readFileSync(filename,'utf8'),{
         require:name=>stubs[name] || realRequire(name), __dirname:path.dirname(filename),
-        process:{env:{PORT:'0'}}, console:{log(){},warn(){},error(){}}, Buffer,setTimeout,clearTimeout,
+        process:{env:{PORT:'0',SUPABASE_URL:'https://storage.example.test',SUPABASE_SERVICE_ROLE_KEY:'isolated-fixture'}}, console:{log(){},warn(){},error(){}}, Buffer,setTimeout,clearTimeout,
       },{filename});
     } catch(e){reject(e);}
   });
@@ -91,6 +92,31 @@ test('server HTTP authentication contracts', async t => {
     const byId = await request('/api/user-profile?userId=7',null,session,'GET');
     assert.equal(byId.status,200);assert.equal((await byId.json()).id,7);
     assert.equal((await request('/api/user-profile?userId=8&email='+user.email,null,session,'GET')).status,403);
+  });
+  await t.test('web and mobile round trips use one saved profile and server-derived age',async()=>{
+    const {profileAge}=require('../profile-fields');
+    const mobileSave=await request('/api/update-profile',{id:7,occupation:'Mobile edit',dob:'2000-01-02',age:999,sex:'Female'},session,'PUT');
+    assert.equal(mobileSave.status,200);
+    let webRead=await request('/api/user-profile?userId=7',null,session,'GET');
+    assert.equal(webRead.headers.get('cache-control'),'no-store');
+    let profile=await webRead.json();assert.equal(profile.occupation,'Mobile edit');assert.equal(profile.age,profileAge('2000-01-02'));assert.equal(profile.sex,'Female');
+    const webSave=await request('/api/update-profile',{id:7,occupation:'Web edit',sex:'Male'},session,'PUT');assert.equal(webSave.status,200);
+    let mobileRead=await request('/api/user-profile?userId=7',null,session,'GET');profile=await mobileRead.json();assert.equal(profile.occupation,'Web edit');assert.equal(profile.sex,'Male');assert.equal(profile.age,profileAge('2000-01-02'));
+    assert.equal((await request('/api/update-profile',{id:7,age:3},session,'PUT')).status,400);
+    assert.equal((await request('/api/update-profile',{id:7,dob:'2999-01-01'},session,'PUT')).status,400);
+    assert.equal((await request('/api/update-profile',{id:7,sex:'invalid'},session,'PUT')).status,400);
+    assert.equal((await request('/api/update-profile',{id:7,dob:null,age:99},session,'PUT')).status,200);
+    mobileRead=await request('/api/user-profile?userId=7',null,session,'GET');assert.equal((await mobileRead.json()).age,null);
+  });
+  await t.test('mobile and web photo uploads update the same profile without changing its information',async()=>{
+    for(const source of ['mobile','web']){
+      const form=new FormData();form.append('userId','7');form.append('profileImage',new Blob(['isolated image'],{type:'image/png'}),source+'.png');
+      const uploaded=await fetch(base+'/api/upload-profile-picture',{method:'POST',headers:{Authorization:'Bearer '+session},body:form});
+      assert.equal(uploaded.status,200);const {imagePath}=await uploaded.json();assert.match(imagePath,/^uploads\/profile_.*\.png$/);
+      const otherClient=await request('/api/user-profile?userId=7',null,session,'GET');const profile=await otherClient.json();assert.equal(profile.profile_picture,imagePath);assert.equal(profile.occupation,'Web edit');
+    }
+    const denied=new FormData();denied.append('userId','8');denied.append('profileImage',new Blob(['isolated image'],{type:'image/png'}),'other.png');
+    assert.equal((await fetch(base+'/api/upload-profile-picture',{method:'POST',headers:{Authorization:'Bearer '+session},body:denied})).status,403);
   });
   await t.test('mobile billing hides unpublished/denied bills, maps approval and survives storage failure',async()=>{
     const response=await request('/api/user-billings/7',null,session,'GET');
