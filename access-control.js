@@ -18,7 +18,7 @@ function accessControl({auth,db}) {
    const own=value=>value!=null && String(value)===String(req.actor.id);
    const read=p.match(/^\/api\/(?:user-appointments|user-billings|patient-records|patient-final-diagnoses|notifications)\/(\d+)$/);
    if(read && req.method==='GET' && own(read[1])) return next();
-   if(p==='/api/user-profile' && String(req.query.email).toLowerCase()===String(req.actor.email).toLowerCase()) return next();
+   if(p==='/api/user-profile' && (req.query.userId ? own(req.query.userId) : String(req.query.email).toLowerCase()===String(req.actor.email).toLowerCase())) return next();
    if(['/api/dentists','/api/appointments/check-availability','/api/booked-times'].includes(p) && req.method==='GET') return next();
    if(p==='/api/update-profile' && own(req.body.id)) return next();
    if(p==='/api/upload-profile-picture') return next(); // multipart user ID is checked after multer

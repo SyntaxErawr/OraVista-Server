@@ -22,6 +22,12 @@ test('server HTTP authentication contracts', async t => {
       if(sql.includes('SET billing_status')) { Object.assign(bills[0], {billing_status:args[0],amount:args[1],receipt_details:JSON.parse(args[3])}); return {rows:[{...bills[0]}]}; }
       if(sql.includes('FROM users')) return {rows:args[0]===user.email || String(args[0])===String(user.id)?[{...user}]:[]};
       if(sql.startsWith('UPDATE users SET password')) {user.password=args[0];return {rows:[]};}
+      if (sql.startsWith('UPDATE users SET ') && sql.includes(' RETURNING *')) {
+        if (String(args.at(-1)) !== String(user.id)) return { rows: [] };
+        const columns = sql.split(' SET ')[1].split(' WHERE ')[0].split(', ').map(a => a.split(' = ')[0]);
+        columns.forEach((column, i) => { user[column] = args[i]; });
+        return { rows: [{ ...user }] };
+      }
       return {rows:[]};
     },
     async connect(){return {...this,release(){}};}, async end() {},
@@ -68,6 +74,23 @@ test('server HTTP authentication contracts', async t => {
     const no=await fetch(base+'/api/user-profile?email='+user.email);assert.equal(no.status,401);assert.equal((await no.json()).code,'SESSION_EXPIRED');
     const yes=await request('/api/user-profile?email='+user.email,null,session,'GET');assert.equal(yes.status,200);assert.equal((await yes.json()).password,undefined);
     const other=await request('/api/user-profile?email=other@example.test',null,session,'GET');assert.equal(other.status,403);
+  });
+  await t.test('confirmed web profile updates persist to the mobile read without erasing medical fields or photo', async () => {
+    Object.assign(user, {blood_type:'O+', allergies:'Saved allergy', insurance:'Saved insurance', policy_number:'TEST', profile_picture:'uploads/original.png', phone:'09123456789'});
+    const response = await request('/api/update-profile', {id:7, firstName:'Updated', lastName:'Patient', email:user.email, sex:'', dob:'', age:'', phone:user.phone, occupation:'Student'}, session, 'PUT');
+    assert.equal(response.status,200);
+    assert.equal((await response.json()).user.password,undefined);
+    const read = await request('/api/user-profile?email='+user.email,null,session,'GET');
+    const saved = await read.json();
+    assert.equal(saved.occupation,'Student');assert.equal(saved.first_name,'Updated');assert.equal(saved.dob,null);
+    assert.equal(saved.blood_type,'O+');assert.equal(saved.allergies,'Saved allergy');assert.equal(saved.insurance,'Saved insurance');assert.equal(saved.policy_number,'TEST');assert.equal(saved.profile_picture,'uploads/original.png');
+    assert.equal((await request('/api/update-profile',{id:8,occupation:'Other'},session,'PUT')).status,403);
+    assert.equal((await request('/api/update-profile',{id:7},session,'PUT')).status,400);
+    assert.equal((await request('/api/update-profile',{id:7,occupation:''},session,'PUT')).status,200);
+    assert.equal(user.occupation,'');assert.equal(user.phone,'09123456789');assert.equal(user.blood_type,'O+');
+    const byId = await request('/api/user-profile?userId=7',null,session,'GET');
+    assert.equal(byId.status,200);assert.equal((await byId.json()).id,7);
+    assert.equal((await request('/api/user-profile?userId=8&email='+user.email,null,session,'GET')).status,403);
   });
   await t.test('mobile billing hides unpublished/denied bills, maps approval and survives storage failure',async()=>{
     const response=await request('/api/user-billings/7',null,session,'GET');

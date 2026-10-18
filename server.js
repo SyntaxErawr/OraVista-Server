@@ -343,13 +343,13 @@ app.post('/api/check-email', async (req, res) => {
 
 // Mobile compatibility: resolve a user profile by email.
 app.get('/api/user-profile', async (req, res) => {
-    const { email } = req.query;
-    if (!email) return res.status(400).json({ message: "Email is required." });
+    const { email, userId } = req.query;
+    if (!email && !userId) return res.status(400).json({ message: "A patient ID or email is required." });
 
     try {
         const { rows } = await db.query(
-            'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
-            [String(email).trim()]
+            userId ? 'SELECT * FROM users WHERE id = $1' : 'SELECT * FROM users WHERE LOWER(email) = LOWER($1)',
+            [String(userId || email).trim()]
         );
         if (rows.length === 0) {
             return res.status(404).json({ message: "Not found" });
@@ -365,29 +365,32 @@ app.get('/api/user-profile', async (req, res) => {
 });
 
 app.put('/api/update-profile', async (req, res) => {
-    const {
-        id, firstName, lastName, email, sex, dob, age, phone,
-        occupation, blood_type, allergies, insurance, policy_number
-    } = req.body;
-
-    // Convert empty strings to null for database columns that expect numbers or dates
-    const safeAge = age === '' ? null : age;
-    const safeDob = dob === '' ? null : dob;
-
+    const { id } = req.body;
+    const columns = {
+        firstName: 'first_name', lastName: 'last_name', email: 'email',
+        sex: 'sex', dob: 'dob', age: 'age', phone: 'phone', occupation: 'occupation',
+        blood_type: 'blood_type', allergies: 'allergies', insurance: 'insurance', policy_number: 'policy_number'
+    };
+    // Update only supplied fields. A web information save must not erase medical data or the photo.
+    const fields = Object.keys(columns).filter(key => Object.hasOwn(req.body, key));
+    if (!id || !fields.length) return res.status(400).json({ message: 'Provide a patient and profile changes.' });
+    const values = fields.map(key => {
+        const value = req.body[key];
+        if ((key === 'dob' || key === 'age') && value === '') return null;
+        return typeof value === 'string' ? value.trim() : value;
+    });
+    const assignments = fields.map((key, i) => `${columns[key]} = $${i + 1}`).join(', ');
     try {
-        const query = `UPDATE users SET first_name = $1, last_name = $2, email = $3, sex = $4, dob = $5, age = $6, phone = $7, occupation = $8, blood_type = $9, allergies = $10, insurance = $11, policy_number = $12 WHERE id = $13`;
-
-        // Pass safeAge and safeDob to the database query
-        await db.query(query, [firstName, lastName, email, sex, safeDob, safeAge, phone, occupation, blood_type, allergies, insurance, policy_number, id]);
-
-        res.status(200).json({ message: "Profile updated successfully!" });
+        const { rows } = await db.query(`UPDATE users SET ${assignments} WHERE id = $${values.length + 1} RETURNING *`, [...values, id]);
+        if (!rows.length) return res.status(404).json({ message: 'Patient profile not found.' });
+        const user = { ...rows[0] };
+        delete user.password;
+        res.status(200).json({ message: 'Profile updated successfully!', user });
     } catch (err) {
-        console.error("Database Update Error:", err);
-        res.status(500).json({ message: "Failed to update profile." });
+        console.error('Database Update Error:', err);
+        res.status(err.code === '23505' ? 409 : 500).json({ message: err.code === '23505' ? 'This email is already registered.' : 'Failed to update profile.' });
     }
 });
-
-
 
 app.post('/api/upload-profile-picture', upload.single('profileImage'), async (req, res) => {
     const { userId } = req.body;
