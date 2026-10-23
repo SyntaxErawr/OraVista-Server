@@ -1408,7 +1408,7 @@ app.get('/api/user-billings/:userId', async (req, res) => {
 
     try {
         const { rows } = await db.query(
-            `SELECT a.id, a.user_id, a.booking_ref, a.service_type, a.amount, a.billing_status, a.appointment_date, a.receipt_details, u.first_name, u.last_name
+            `SELECT a.id, a.user_id, a.booking_ref, a.service_type, a.amount, a.billing_status, a.appointment_date, a.receipt_details, a.branch, u.first_name, u.last_name, u.age, u.sex, u.dob
              FROM appointments a JOIN users u ON u.id = a.user_id
              WHERE a.user_id = $1
              ORDER BY a.appointment_date DESC, a.id DESC`,

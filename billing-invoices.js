@@ -1,3 +1,4 @@
+const { drawTreatmentRecord } = require('./clinic-record-layout');
 const crypto = require('node:crypto');
 const { jsPDF } = require('jspdf');
 const BUCKET = 'billing-invoices';
@@ -15,30 +16,7 @@ function amounts(record) {
 const isPublished = record => ['Approved', 'Paid'].includes(record.billing_status);
 function createPDF(record) {
   const doc = new jsPDF();
-  const totals = amounts(record), details = receiptObject(record.receipt_details);
-  doc.setFontSize(19);
-  doc.text('OraVista - Billing statement', 18, 24);
-  doc.setFontSize(11);
-  const lines = [
-    `Reference: ${record.booking_ref || record.id}`,
-    `Patient: ${[record.first_name, record.last_name].filter(Boolean).join(' ') || record.user_id}`,
-    `Date: ${String(record.appointment_date instanceof Date ? record.appointment_date.toISOString() : record.appointment_date).slice(0, 10)}`,
-    `Service: ${record.service_type || 'Dental treatment'}`,
-    `Status: ${record.billing_status === 'Approved' ? 'Pending payment' : record.billing_status}`,
-    `Charge: PHP ${totals.charge.toFixed(2)}`,
-    `Paid: PHP ${totals.paid.toFixed(2)}`,
-    `Balance: PHP ${totals.balance.toFixed(2)}`,
-    ...(details.nextVisit ? [`Next visit: ${details.nextVisit}`] : []),
-    'For personal records. An unpaid bill is not proof of payment.',
-  ];
-  let y = 40;
-  for (const line of lines) {
-    for (const part of doc.splitTextToSize(line, 174)) {
-      if (y > 275) { doc.addPage(); y = 22; }
-      doc.text(part, 18, y); y += 7;
-    }
-    y += 4;
-  }
+  drawTreatmentRecord(doc, record, record, amounts(record));
   return Buffer.from(doc.output('arraybuffer'));
 }
 function createInvoiceService(supabase) {
@@ -66,7 +44,7 @@ function createInvoiceService(supabase) {
     // Keep explicitly uploaded legacy documents compatible.
     if (typeof record.receipt_details === 'string' && /^https:\/\//i.test(record.receipt_details)) return record.receipt_details;
     await ensureBucket();
-    const fingerprint = crypto.createHash('sha256').update(JSON.stringify(record)).digest('hex').slice(0, 24);
+    const fingerprint = crypto.createHash('sha256').update('clinic-treatment-v2:' + JSON.stringify(record)).digest('hex').slice(0, 24);
     const file = `${record.user_id}/${record.id}-${fingerprint}.pdf`;
     const bucket = supabase.storage.from(BUCKET);
     let signed = await bucket.createSignedUrl(file, 3600);

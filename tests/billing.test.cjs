@@ -55,3 +55,14 @@ test('permission errors never trigger bucket creation', async()=>{
  const service=createInvoiceService({storage:{getBucket:async()=>({error:{status:403,message:'Forbidden'}}),createBucket:async()=>{created=true;return {};}}});
  await assert.rejects(service(bill));assert.equal(created,false);
 });
+
+
+test('clinic treatment PDF uses clinic identity, matching branch and paid totals', () => {
+ const pdf = createPDF({...bill, branch:'Sta. Ana', billing_status:'Paid'}).toString('latin1');
+ assert.match(pdf, /KING EPRES DENTAL CLINIC/);
+ assert.match(pdf, /TREATMENT RECORD/);
+ assert.match(pdf, /Tejeron/);
+ assert.match(pdf, /PHP 1000.00/);
+ assert.match(pdf, /PHP 0.00/);
+ assert.doesNotMatch(pdf, /OraVista - Billing statement|0874D/);
+});

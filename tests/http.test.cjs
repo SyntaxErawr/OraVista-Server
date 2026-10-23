@@ -36,7 +36,17 @@ test('server HTTP authentication contracts', async t => {
   // A real pool client has its own query method, independent of pool.query.
   const queryClient = db.query.bind(db);
   db.connect = async () => ({ query: queryClient, release() {} });
-  let app, listen;
+  let app, listen, invoiceBase = '', invoiceStorageEnabled = false;
+  const invoiceFiles = new Map();
+  const storage = {
+    getBucket: async () => invoiceStorageEnabled ? {data:{public:false}} : {error:{status:503}},
+    from: () => ({
+      upload: async (file, data) => { invoiceFiles.set(file, data); return {data:{}}; },
+      createSignedUrl: async file => invoiceFiles.has(file)
+        ? {data:{signedUrl:invoiceBase+'/fixture-invoice?file='+encodeURIComponent(file)}}
+        : {error:{status:404}},
+    }),
+  };
   const ready = new Promise((resolve,reject)=>{
     const factory = () => {
       app=express();listen=app.listen.bind(app);
@@ -44,7 +54,7 @@ test('server HTTP authentication contracts', async t => {
     };
     Object.assign(factory,express);
     const filename=path.join(__dirname,'../server.js'), realRequire=createRequire(filename);
-    const stubs={express:factory,pg:{Pool:class {constructor(){return db;}}},nodemailer:{createTransport:()=>({sendMail:async message=>mail.push(message)})},dotenv:{config(){}},'@supabase/supabase-js':{createClient:()=>({storage:{from:()=>({upload:async()=>({data:{},error:null})})}})},fs:{...fs,existsSync:()=>true}};
+    const stubs={express:factory,pg:{Pool:class {constructor(){return db;}}},nodemailer:{createTransport:()=>({sendMail:async message=>mail.push(message)})},dotenv:{config(){}},'@supabase/supabase-js':{createClient:()=>({storage})},fs:{...fs,existsSync:()=>true}};
     try {
       vm.runInNewContext(fs.readFileSync(filename,'utf8'),{
         require:name=>stubs[name] || realRequire(name), __dirname:path.dirname(filename),
@@ -53,9 +63,14 @@ test('server HTTP authentication contracts', async t => {
     } catch(e){reject(e);}
   });
   await ready;
+  app.get('/fixture-invoice',(req,res)=>{
+    const pdf=invoiceFiles.get(req.query.file);
+    if (!pdf) return res.sendStatus(404);
+    res.type('application/pdf').send(pdf);
+  });
   const server=listen(0,'127.0.0.1');await new Promise(resolve=>server.on('listening',resolve));
   t.after(()=>new Promise(resolve=>server.close(resolve)));
-  const base=`http://127.0.0.1:${server.address().port}`;
+  const base=`http://127.0.0.1:${server.address().port}`; invoiceBase=base;
   const request=(url,body,token,method='POST')=>fetch(base+url,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},...(body?{body:JSON.stringify(body)}:{})});
   let challenge,session;
   await t.test('health responds after auth storage initialization',async()=>{
@@ -124,6 +139,38 @@ test('server HTTP authentication contracts', async t => {
     assert.equal(data.records.length,3);assert.equal(data.records[0].status,'Approved');
     assert.equal(data.totalOutstanding,750);assert.equal(data.records[0].paid,250);assert.equal(data.records[0].balance,750);assert.equal(data.records[1].balance,0);assert.equal(data.records[0].invoice_path,null);
     assert.equal((await request('/api/user-billings/8',null,session,'GET')).status,403);
+  });
+  await t.test('actual mobile billing client downloads matching approved and paid clinic PDFs',async()=>{
+    const before=structuredClone(bills[0]);
+    invoiceStorageEnabled=true;
+    try {
+      Object.assign(bills[0],{first_name:'Test',last_name:'Patient',branch:'Gil Puyat, Pasay',sex:'Female',age:22});
+      const clientModule={exports:{}};
+      const mobileFile=path.resolve(__dirname,'../../../OraVista/MyApp/src/utils/patientData.js');
+      vm.runInNewContext(fs.readFileSync(mobileFile,'utf8').replace(/export /g,'')+';module.exports={loadBillings,billingBreakdown};',{
+        module:clientModule,AbortController,setTimeout,clearTimeout,
+        fetch:(url,options={})=>fetch(url,{...options,headers:{...options.headers,Authorization:`Bearer ${session}`}}),
+      },{filename:mobileFile});
+      const client=clientModule.exports;
+      let result=await client.loadBillings(base,7);
+      let selected=result.records.find(r=>r.id===1);
+      assert.equal(selected.status,'Approved'); assert.equal(result.totalOutstanding,750);
+      assert.equal(client.billingBreakdown(selected).balance,750);
+      const firstURL=selected.invoice_path;
+      let pdfResponse=await fetch(firstURL);
+      assert.match(pdfResponse.headers.get('content-type'),/application\/pdf/);
+      let pdf=Buffer.from(await pdfResponse.arrayBuffer()).toString('latin1');
+      assert.match(pdf,/KING EPRES DENTAL CLINIC/); assert.match(pdf,/Test Patient/);
+      assert.match(pdf,/PHP 1000.00/); assert.match(pdf,/PHP 250.00/); assert.match(pdf,/PHP 750.00/);
+      user.role='staff';
+      const paid=await request('/api/staff/billings/1',{billing_status:'Paid',amount:1000,service_type:'Cleaning',expected_paid:250,receipt_details:{paid:1000,paymentMethod:'Cash'}},session,'PUT');
+      assert.equal(paid.status,200); user.role='patient';
+      result=await client.loadBillings(base,7); selected=result.records.find(r=>r.id===1);
+      assert.equal(selected.status,'Paid'); assert.equal(selected.balance,0); assert.equal(result.totalOutstanding,0);
+      assert.notEqual(selected.invoice_path,firstURL);
+      pdf=Buffer.from(await (await fetch(selected.invoice_path)).arrayBuffer()).toString('latin1');
+      assert.match(pdf,/PHP 0.00/); assert.match(pdf,/Status: Paid/);
+    } finally { bills[0]=before; user.role='patient'; payments.length=0; invoiceStorageEnabled=false; }
   });
   await t.test('clinic billing rejects overpayments and recomputes saved balance',async()=>{
     user.role='staff';
