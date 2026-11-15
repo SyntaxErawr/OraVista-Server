@@ -33,7 +33,8 @@ app.use(cors({
         "http://localhost:5173",   // Vite local
         "https://oravista.vercel.app", // Deployment preview
         "https://ora-vista-web.vercel.app",
-        "https://oravista.site"
+        "https://oravista.site",
+        "https://oravista-web.vercel.app"
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
