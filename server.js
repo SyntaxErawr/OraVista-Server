@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { profileAge, profileSex } = require('./profile-fields');
+const { catalog: clinicCatalog, services: clinicServices, findService, bookingAmount } = require('./service-catalog');
 const { registerDiagnosticRecords } = require('./diagnosticRecords');
 require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
@@ -172,7 +173,7 @@ const { installOversight, paymentDelta } = require('./oversight');
 const oversight = installOversight(app, db);
 const authRoute=fn=>async(req,res)=>{try {const result=await fn(req);await oversight.recordAuth(req,result?.user || req.actor,true);res.json(result);}catch(e){console.error('Authentication request failed:',e.status||500);try {await oversight.recordAuth(req,req.actor,false);}catch(logError){console.error('Authentication audit failed:',logError.message);}res.status(e.status||500).json({message:e.status?e.message:'Unable to complete verification. Please try again.'});}};
 const sessionFor=req=>auth.session((req.get('authorization')||'').replace(/^Bearer /i,''));
-app.get('/api/auth-health', (req,res)=>res.json({authentication:'server-verified-v1'}));
+app.get('/api/auth-health', (req,res)=>res.json({authentication:'server-verified-v1',pricingCatalog:clinicCatalog.version}));
 app.post('/api/login',authRoute(req=>auth.login(req.body)));
 app.post('/api/send-otp',authRoute(async req=>auth.request(req.body,req.body.action==='change_password'?await sessionFor(req):null)));
 app.post('/api/forgot-password',authRoute(req=>auth.request({...req.body,action:'forgot_password'})));
@@ -573,13 +574,7 @@ app.get('/api/patient-records/:userId', async (req, res) => {
 // Mobile and web currently use a few different display labels for the same
 // clinic data. Normalize only known mobile aliases before reading/writing the
 // shared appointments table; existing web labels pass through unchanged.
-const mobileServiceAliases = {
-    'Orthodontics Installation': 'Braces Installation',
-    'Orthodontics Adjustment': 'Braces Adjustment',
-    'Veneers / Esthetics': 'Veneers',
-    'Root Canal Treatment': 'Root Canal (RCT)',
-    'Whitening': 'Teeth Whitening'
-};
+const mobileServiceAliases = Object.fromEntries(clinicServices.filter(service => service.mobileName !== service.name).map(service => [service.mobileName, service.name]));
 const mobileServiceNames = Object.fromEntries(
     Object.entries(mobileServiceAliases).map(([mobileName, webName]) => [webName, mobileName])
 );
@@ -593,22 +588,9 @@ const mobileBranchAliases = {
     'Sta. Ana': 'Sta. Ana, Manila',
     'Angeles': 'Angeles, Pampanga'
 };
-const webServiceBasePrices = {
-    'Oral Prophylaxis': 1500,
-    Restoration: 1200,
-    Extraction: 1000,
-    'Braces Installation': 35000,
-    'Braces Adjustment': 1000,
-    Veneers: 15000,
-    'Root Canal (RCT)': 8000,
-    'Wisdom Tooth Surgery': 10000,
-    Dentures: 5000,
-    'Fixed Bridge': 12000,
-    'Teeth Whitening': 7000
-};
 function normalizeBookingService(value) {
     const name = String(value || '').trim();
-    return mobileServiceAliases[name] || name;
+    return findService(name)?.name || name;
 }
 function mobileBookingServiceName(value) {
     const name = String(value || '').trim();
@@ -624,12 +606,7 @@ function normalizeBookingBranch(value) {
 }
 
 // Use the same service durations as the booking page when checking overlapping slots.
-const appointmentDurations = {
-    'Oral Prophylaxis': 30, Restoration: 60, Extraction: 60,
-    'Braces Installation': 60, 'Braces Adjustment': 30, Veneers: 120,
-    'Root Canal (RCT)': 120, 'Wisdom Tooth Surgery': 180, Dentures: 30,
-    'Fixed Bridge': 120, 'Teeth Whitening': 90
-};
+const appointmentDurations = Object.fromEntries(clinicServices.map(service => [service.name, service.durationMinutes]));
 function appointmentDuration(service) {
     const name = String(service || '').trim();
     if (appointmentDurations[name]) return appointmentDurations[name];
@@ -750,8 +727,7 @@ app.post('/api/book-appointment', async (req, res) => {
         dentist_name, dentist,
         appointment_date, date,
         appointment_time, time,
-        amount, branch,
-        basePrice, base_price, price, service_price
+        branch
     } = req.body || {};
 
     const resolvedUserId = user_id ?? userId;
@@ -767,17 +743,10 @@ app.post('/api/book-appointment', async (req, res) => {
         return res.status(400).json({ message: "Missing required booking information." });
     }
 
-    const mobileStyleRequest = amount === undefined && (
-        userId !== undefined || service !== undefined || dentist !== undefined ||
-        date !== undefined || time !== undefined || basePrice !== undefined ||
-        base_price !== undefined || price !== undefined || service_price !== undefined
-    );
-    const suppliedPrice = amount ?? basePrice ?? base_price ?? price ?? service_price;
-    const amountToSave = mobileStyleRequest && webServiceBasePrices[normalizedService] !== undefined
-        ? webServiceBasePrices[normalizedService]
-        : Number(suppliedPrice ?? 0);
-
     try {
+        // The clinic catalog determines new booking estimates for every client.
+        // Display strings and client-supplied amounts never establish the price.
+        const amountToSave = bookingAmount(normalizedService);
         const randomString = crypto.randomBytes(3).toString('hex').toUpperCase();
         const booking_ref = `OV - ${randomString}`;
 

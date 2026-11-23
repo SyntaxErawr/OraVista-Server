@@ -10,10 +10,11 @@ const {createRequire} = require('node:module');
 
 test('server HTTP authentication contracts', async t => {
   const user = {id:7,email:'patient@example.test',password:await bcrypt.hash('OldPassword1!',4),role:'patient',first_name:'Test'};
-  const states = new Map(), mail = [], payments = [];
+  const states = new Map(), mail = [], payments = [], bookings = [];
   const bills = ['Approved','Paid','Denied',null,'Pending'].map((status,i)=>({id:i+1,user_id:7,service_type:'Cleaning',amount:1000,billing_status:status,appointment_date:'2026-10-05',receipt_details:{paid:250}}));
   const db = {
     async query(sql, args=[]) {
+      if (sql.includes('INSERT INTO appointments ')) { bookings.push(args); return {rows:[]}; }
       if(sql.startsWith('SELECT data FROM auth_state')) return {rows:states.has(args[0])?[{data:structuredClone(states.get(args[0]))}]:[]};
       if(sql.startsWith('INSERT INTO auth_state')) {states.set(args[0],JSON.parse(args[1]));return {rows:[]};}
       if(sql.includes('FROM appointments a JOIN users')) return {rows:bills};
@@ -74,7 +75,7 @@ test('server HTTP authentication contracts', async t => {
   const request=(url,body,token,method='POST')=>fetch(base+url,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})},...(body?{body:JSON.stringify(body)}:{})});
   let challenge,session;
   await t.test('health responds after auth storage initialization',async()=>{
-    const r=await fetch(base+'/api/auth-health');assert.equal(r.status,200);assert.equal((await r.json()).authentication,'server-verified-v1');
+    const r=await fetch(base+'/api/auth-health');assert.equal(r.status,200);const health=await r.json();assert.equal(health.authentication,'server-verified-v1');assert.equal(health.pricingCatalog,require('../service-catalog').catalog.version);
   });
   await t.test('browser preflight permits Authorization and PUT',async()=>{
     const r=await fetch(base+'/api/update-profile',{method:'OPTIONS',headers:{Origin:'https://oravista.site','Access-Control-Request-Method':'PUT','Access-Control-Request-Headers':'authorization,content-type'}});
@@ -85,6 +86,28 @@ test('server HTTP authentication contracts', async t => {
   });
   await t.test('verification exchanges the emailed code for a session',async()=>{
     const r=await request('/api/verify-otp',{email:user.email,challengeId:challenge.challengeId,code:mail[0].text.match(/\b\d{6}\b/)[0]});assert.equal(r.status,200);session=(await r.json()).token;assert.ok(session);
+  });
+  await t.test('web, mobile and older clients save the same clinic booking estimates regardless of submitted prices',async()=>{
+    const {services}=require('../service-catalog');
+    for (const service of services) {
+      const common={dentist_name:'Dr. Test',appointment_date:'2099-11-26',appointment_time:'10:00 AM',branch:'Main Branch'};
+      const requests=[
+        {...common,user_id:7,service_type:service.name,amount:999999},
+        {...common,userId:7,service:service.mobileName,amount:0,basePrice:123,price:456,base_price:789,service_price:999},
+        {...common,userId:7,service:service.mobileName,basePrice:35000},
+      ];
+      for (const body of requests) {
+        const response=await request('/api/book-appointment',body,session);
+        assert.equal(response.status,201,service.name);
+        assert.equal(bookings.at(-1)[2],service.name);
+        assert.equal(bookings.at(-1)[6],'Pending');
+        assert.equal(bookings.at(-1)[7],service.basePrice ?? 0);
+      }
+    }
+    const before=bookings.length;
+    const unknown=await request('/api/book-appointment',{user_id:7,service_type:'Unsupported',dentist_name:'Dr. Test',appointment_date:'2099-11-26',appointment_time:'10:00 AM',amount:1},session);
+    assert.equal(unknown.status,400);assert.equal(bookings.length,before);
+    assert.equal(bills[0].amount,1000);
   });
   await t.test('protected profile denies missing session and permits its owner',async()=>{
     const no=await fetch(base+'/api/user-profile?email='+user.email);assert.equal(no.status,401);assert.equal((await no.json()).code,'SESSION_EXPIRED');

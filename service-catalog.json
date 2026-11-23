@@ -1,0 +1,124 @@
+{
+  "version": "clinic-offers-2026-11-23",
+  "currency": "PHP",
+  "pricingNotice": "Promotional rates are for cash payments. Confirm credit-card rates and final charges with the clinic. Case-to-case services require a clinic quote.",
+  "categories": [
+    {
+      "name": "General Dentistry",
+      "mobileName": "General Dentistry",
+      "services": [
+        {
+          "name": "Oral Prophylaxis",
+          "mobileName": "Oral Prophylaxis",
+          "basePrice": 500,
+          "priceLabel": "Starts ₱500",
+          "priceType": "starting",
+          "durationMinutes": 30,
+          "priceNote": "Minimum ₱500; the fee depends on case severity."
+        },
+        {
+          "name": "Restoration",
+          "mobileName": "Restoration",
+          "basePrice": 500,
+          "priceLabel": "Starts ₱500",
+          "priceType": "starting",
+          "durationMinutes": 60,
+          "priceNote": "Back tooth: minimum ₱500 per surface. Front tooth: minimum ₱700 per surface."
+        },
+        {
+          "name": "Extraction",
+          "mobileName": "Extraction",
+          "basePrice": 700,
+          "priceLabel": "Starts ₱700",
+          "priceType": "starting",
+          "durationMinutes": 60,
+          "priceNote": "Minimum ₱700, excluding third molars and wisdom teeth."
+        }
+      ]
+    },
+    {
+      "name": "Orthodontics",
+      "mobileName": "Orthodontics (Braces, Veneers)",
+      "services": [
+        {
+          "name": "Braces Installation",
+          "mobileName": "Orthodontics Installation",
+          "basePrice": 4000,
+          "priceLabel": "₱4,000 down payment",
+          "priceType": "down_payment",
+          "durationMinutes": 60,
+          "priceNote": "₱1,000 monthly/adjustment fee. Total package: ₱40,000–₱45,000 depending on the case."
+        },
+        {
+          "name": "Braces Adjustment",
+          "mobileName": "Orthodontics Adjustment",
+          "basePrice": 1000,
+          "priceLabel": "₱1,000",
+          "priceType": "fixed",
+          "durationMinutes": 30,
+          "priceNote": "Monthly/adjustment fee for the installment package."
+        },
+        {
+          "name": "Veneers",
+          "mobileName": "Veneers / Esthetics",
+          "basePrice": 3500,
+          "priceLabel": "Starts ₱3,500",
+          "priceType": "starting",
+          "durationMinutes": 120,
+          "priceNote": "Per unit: direct composite ₱3,500; indirect composite ₱4,500; Ceramage ₱6,500; Emax ₱15,000."
+        }
+      ]
+    },
+    {
+      "name": "Restorative Treatment",
+      "mobileName": "Restorative Treatments",
+      "services": [
+        {
+          "name": "Root Canal (RCT)",
+          "mobileName": "Root Canal Treatment",
+          "basePrice": null,
+          "priceLabel": "Case to Case",
+          "priceType": "quote",
+          "durationMinutes": 120,
+          "priceNote": "The clinic determines the fee after consultation."
+        },
+        {
+          "name": "Wisdom Tooth Surgery",
+          "mobileName": "Wisdom Tooth Surgery",
+          "basePrice": null,
+          "priceLabel": "Case to Case",
+          "priceType": "quote",
+          "durationMinutes": 180,
+          "priceNote": "The clinic determines the fee after consultation."
+        },
+        {
+          "name": "Dentures",
+          "mobileName": "Dentures",
+          "basePrice": null,
+          "priceLabel": "Case to Case",
+          "priceType": "quote",
+          "durationMinutes": 30,
+          "priceNote": "The clinic determines the fee after consultation."
+        },
+        {
+          "name": "Fixed Bridge",
+          "mobileName": "Fixed Bridge",
+          "basePrice": 3500,
+          "priceLabel": "Starts ₱3,500",
+          "priceType": "starting",
+          "durationMinutes": 120,
+          "priceNote": "Per unit: plastic ₱3,500; porcelain fused to metal ₱4,500; porcelain fused to zirconia ₱12,500; zirconia ₱18,000."
+        },
+        {
+          "name": "Teeth Whitening",
+          "mobileName": "Whitening",
+          "basePrice": null,
+          "priceLabel": "Case to Case",
+          "priceType": "quote",
+          "durationMinutes": 90,
+          "priceNote": "The clinic determines the fee after consultation."
+        }
+      ]
+    }
+  ]
+}
