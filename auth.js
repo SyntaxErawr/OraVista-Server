@@ -24,10 +24,10 @@ function postgresStore(db) {
     }
   };
 }
-function createAuth({store,findUser,compare,hash,send,updatePassword,now=Date.now}) {
+function createAuth({store,findUser,compare,hash,send,updatePassword,eraseAppAccess,now=Date.now}) {
   const email = value => String(value || '').trim().toLowerCase();
   const stateKey = async key => { const user = await findUser(key); return user ? `account:${user.id}` : `email:${key}`; };
-  const enabled = user => user && user.is_active !== false && !['disabled','deleted','inactive'].includes(String(user.status || '').toLowerCase());
+  const enabled = user => user && !user.account_deleted_at && user.is_active !== false && !['disabled','deleted','inactive'].includes(String(user.status || '').toLowerCase());
   const lock = state => { if(state.lockedUntil > now()) throw fail('Too many attempts. Try again in 15 minutes.',429); if(state.lockedUntil) {state.lockedUntil=0;state.failures=0;} };
   function badAttempt(state) { state.failures=(state.failures||0)+1; if(state.failures>=5) state.lockedUntil=now()+15*60*1000; }
   function token(state, user, purpose, ttl) {
@@ -93,6 +93,32 @@ function createAuth({store,findUser,compare,hash,send,updatePassword,now=Date.no
         if(!entry || entry.purpose!=='session' || entry.expires<=now()) throw fail('Your session expired. Please sign in again.',401);
         return publicUser(user);
       });
+    },
+    async deleteAccount(body, raw) {
+      if (!/^\d+\.[a-f0-9]{64}$/.test(raw || '')) throw Object.assign(fail('Please sign in again.',401),{code:'SESSION_EXPIRED'});
+      if (!body || body.confirmation !== true) throw fail('Confirm that you want to permanently delete this account.');
+      if (typeof body.password !== 'string' || !body.password || body.password.length > 128) throw fail('Enter your current OraVista password.');
+      const id = raw.split('.')[0];
+      if (String(body.accountId) !== id) throw fail('The signed-in account changed. Please reopen Delete Account.',409);
+      if (!eraseAppAccess) throw fail('Account deletion is not available yet.',503);
+      return store.transaction(`account:${id}`, async (state,client) => {
+        const entry = state.tokens?.[digest(raw)];
+        const user = await findUser(null,id,client);
+        if (!enabled(user) || !entry || entry.purpose !== 'session' || entry.expires <= now()) throw Object.assign(fail('Your session expired. Please sign in again.',401),{code:'SESSION_EXPIRED'});
+        if (String(user.role).toLowerCase() !== 'patient') throw fail('Only patient accounts can be deleted here.',403);
+        const attempts = state.deletion || (state.deletion={failures:0,lockedUntil:0});
+        if (attempts.lockedUntil > now()) throw Object.assign(fail('Too many incorrect passwords. Try again in 15 minutes.',429),{retryAfter:Math.ceil((attempts.lockedUntil-now())/1000)});
+        if (attempts.lockedUntil) {attempts.failures=0;attempts.lockedUntil=0;}
+        if (!(await compare(body.password,user.password))) {
+          attempts.failures++;
+          if (attempts.failures >= 5) attempts.lockedUntil=now()+15*60000;
+          return {error:fail('Incorrect current password.',401)};
+        }
+        await eraseAppAccess(user,client);
+        for (const key of Object.keys(state)) delete state[key];
+        state.deletedAt = new Date(now()).toISOString();
+        return {deleted:true,accountId:user.id};
+      }).then(result=>{if(result.error) throw result.error;return result;});
     },
     async reset(body,actor) {
       if(!strong(body.newPassword)) throw fail('Use 8-128 characters with uppercase, lowercase, number and symbol.');

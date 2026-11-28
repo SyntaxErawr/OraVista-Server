@@ -10,10 +10,20 @@ const {createRequire} = require('node:module');
 
 test('server HTTP authentication contracts', async t => {
   const user = {id:7,email:'patient@example.test',password:await bcrypt.hash('OldPassword1!',4),role:'patient',first_name:'Test'};
-  const states = new Map(), mail = [], payments = [], bookings = [];
+  const states = new Map(), mail = [], payments = [], bookings = [], cleanupJobs = [];
   const bills = ['Approved','Paid','Denied',null,'Pending'].map((status,i)=>({id:i+1,user_id:7,service_type:'Cleaning',amount:1000,billing_status:status,appointment_date:'2026-10-05',receipt_details:{paid:250}}));
   const db = {
     async query(sql, args=[]) {
+      if(sql.startsWith('INSERT INTO account_deletion_cleanup')) {cleanupJobs.push({id:cleanupJobs.length+1,user_id:Number(args[0]),bucket:'profile-photo',object_path:args[1]});return {rows:[]};}
+      if(sql.startsWith('SELECT * FROM account_deletion_cleanup')) return {rows:cleanupJobs.filter(job=>!args[0] || job.user_id===Number(args[0]))};
+      if(sql.startsWith('SELECT id FROM account_deletion_cleanup')) return {rows:cleanupJobs.filter(job=>job.user_id===Number(args[0]))};
+      if(sql.startsWith('SELECT id FROM users WHERE profile_picture')) return {rows:[]};
+      if(sql.startsWith('DELETE FROM auth_state')) {states.delete(args[0]);return {rows:[]};}
+      if(sql.startsWith('UPDATE users SET email=$2')) {
+        if(user.account_deleted_at) return {rows:[]};
+        Object.assign(user,{email:args[1],password:'',phone:null,occupation:null,profile_picture:null,status:'Deleted',account_deleted_at:'2026-11-28T00:00:00Z'});
+        return {rows:[{id:user.id}]};
+      }
       if (sql.includes('INSERT INTO appointments ')) { bookings.push(args); return {rows:[]}; }
       if(sql.startsWith('SELECT data FROM auth_state')) return {rows:states.has(args[0])?[{data:structuredClone(states.get(args[0]))}]:[]};
       if(sql.startsWith('INSERT INTO auth_state')) {states.set(args[0],JSON.parse(args[1]));return {rows:[]};}
@@ -22,7 +32,7 @@ test('server HTTP authentication contracts', async t => {
       if(sql.includes('INSERT INTO payment_events')) { payments.push(args); return {rows:[]}; }
       if(sql.includes('SET billing_status')) { Object.assign(bills[0], {billing_status:args[0],amount:args[1],receipt_details:JSON.parse(args[3])}); return {rows:[{...bills[0]}]}; }
       if(sql.includes('FROM users')) return {rows:args[0]===user.email || String(args[0])===String(user.id)?[{...user}]:[]};
-      if(sql.startsWith('UPDATE users SET profile_picture')) { user.profile_picture=args[0]; return {rows:[]}; }
+      if(sql.startsWith('UPDATE users SET profile_picture')) {if(user.account_deleted_at)return {rows:[]};user.profile_picture=args[0];return {rows:[{id:user.id}]};}
       if(sql.startsWith('UPDATE users SET password')) {user.password=args[0];return {rows:[]};}
       if (sql.startsWith('UPDATE users SET ') && sql.includes(' RETURNING *')) {
         if (String(args.at(-1)) !== String(user.id)) return { rows: [] };
@@ -248,5 +258,24 @@ test('server HTTP authentication contracts', async t => {
       assert.equal(r.status,400);assert.match((await r.json()).errors.email,/already registered/);
     });
   }
+
+  await t.test('password-confirmed deletion retains clinic history and revokes mobile and web API sessions',async()=>{
+    const body={accountId:7,password:'OldPassword1!',confirmation:true};
+    assert.equal((await request('/api/account',body,null,'DELETE')).status,401);
+    assert.equal((await request('/api/account',{...body,confirmation:false},session,'DELETE')).status,400);
+    assert.equal((await request('/api/account',{...body,accountId:8},session,'DELETE')).status,409);
+    const wrong=await request('/api/account',{...body,password:'wrong'},session,'DELETE');
+    assert.equal(wrong.status,401);assert.equal((await wrong.json()).code,undefined);
+    assert.equal((await request('/api/user-profile?userId=7',null,session,'GET')).status,200);
+    const savedBills=JSON.stringify(bills),name=user.first_name,dob=user.dob;
+    const deleted=await request('/api/account',body,session,'DELETE');
+    assert.equal(deleted.status,200);assert.equal(deleted.headers.get('cache-control'),'no-store');
+    const result=await deleted.json();assert.equal(result.deleted,true);assert.equal(typeof result.cleanupPending,'boolean');
+    assert.equal(user.password,'');assert.equal(user.phone,null);assert.equal(user.profile_picture,null);
+    assert.equal(user.first_name,name);assert.equal(user.dob,dob);assert.equal(JSON.stringify(bills),savedBills);
+    assert.equal(user.status,'Deleted');assert.ok(user.account_deleted_at);assert.match(user.email,/oravista\.invalid$/);
+    const old=await request('/api/user-profile?userId=7',null,session,'GET');assert.equal(old.status,401);assert.equal((await old.json()).code,'SESSION_EXPIRED');
+    assert.equal((await request('/api/account',body,session,'DELETE')).status,401);
+  });
 
 });

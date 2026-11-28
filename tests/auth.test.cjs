@@ -6,7 +6,7 @@ function setup(role='patient') {
  const user={id:7,email:'patient@example.test',password:'hash:OldPassword1!',role,first_name:'Test'};
  const store={transaction:async(key,fn)=>{const state=structuredClone(states.get(key)||{});const result=await fn(state,{});states.set(key,state);return result;}};
  const deps={store,findUser:async(email,id)=>(email===user.email || String(id)===String(user.id))?user:null,hash:async value=>'hash:'+value,compare:async(value,hash)=>'hash:'+value===hash,send:async(email,code,purpose)=>mail.push({email,code,purpose}),updatePassword:async(id,hash)=>{user.password=hash;},now:()=>clock};
- return {auth:createAuth(deps),deps,user,mail,advance:ms=>clock+=ms};
+ return {auth:createAuth(deps),deps,user,mail,states,advance:ms=>clock+=ms};
 }
 async function signed(f) {const c=await f.auth.login({email:f.user.email,password:'OldPassword1!'});return f.auth.verify({email:f.user.email,challengeId:c.challengeId,code:f.mail.at(-1).code});}
 test('login requires password and returns an opaque challenge, never the code',async()=>{const f=setup();await assert.rejects(f.auth.login({email:f.user.email,password:'bad'}),/Invalid/);const c=await f.auth.login({email:f.user.email,password:'OldPassword1!'});assert.ok(c.challengeId);assert.equal(c.generatedOtp,undefined);assert.equal(c.token,undefined);assert.equal(c.user.password,undefined);});
@@ -49,4 +49,56 @@ test('PostgreSQL store rolls back exceptions and releases its client',async()=>{
  const store=postgresStore({connect:async()=>({query:async sql=>{calls.push(sql);return {rows:[]};},release:()=>calls.push('release')})});
  await assert.rejects(store.transaction('account:7',()=>{throw Error('mail unavailable');}),/mail unavailable/);
  assert.ok(!calls.some(sql=>sql.startsWith('INSERT')));assert.deepEqual(calls.slice(-2),['ROLLBACK','release']);
+});
+
+function deletionFixture(role='patient') {
+ const fixture=setup(role);
+ const erased=[];
+ fixture.auth=createAuth({...fixture.deps,eraseAppAccess:async user=>{
+   erased.push(user.id);user.password='';user.email=`deleted+${user.id}@oravista.invalid`;
+   user.account_deleted_at='2026-11-28T00:00:00Z';user.status='Deleted';
+ }});
+ return {...fixture,erased};
+}
+const deletionBody={accountId:7,password:'OldPassword1!',confirmation:true};
+test('deletion requires an authenticated patient, the expected account, current password and explicit confirmation',async()=>{
+ const f=deletionFixture(), login=await signed(f);
+ await assert.rejects(f.auth.deleteAccount(deletionBody,''),e=>e.status===401);
+ await assert.rejects(f.auth.deleteAccount({...deletionBody,confirmation:false},login.token),e=>e.status===400);
+ await assert.rejects(f.auth.deleteAccount({...deletionBody,password:''},login.token),e=>e.status===400);
+ await assert.rejects(f.auth.deleteAccount({...deletionBody,accountId:8},login.token),e=>e.status===409);
+ await assert.rejects(f.auth.deleteAccount({...deletionBody,password:'WrongPassword'},login.token),/Incorrect current password/);
+ assert.deepEqual(f.erased,[]);assert.equal((await f.auth.session(login.token)).id,7);
+ const staff=deletionFixture('staff');const session=await staff.auth.login({email:staff.user.email,password:'OldPassword1!'});
+ await assert.rejects(staff.auth.deleteAccount(deletionBody,session.token),e=>e.status===403);
+ assert.deepEqual(staff.erased,[]);
+});
+test('deletion password failures persist across requests and lock for fifteen minutes without logging out the patient',async()=>{
+ const f=deletionFixture(), login=await signed(f);
+ for(let i=0;i<5;i++)await assert.rejects(f.auth.deleteAccount({...deletionBody,password:'wrong'},login.token),e=>e.status===401);
+ await assert.rejects(f.auth.deleteAccount(deletionBody,login.token),e=>e.status===429 && e.retryAfter===900);
+ assert.equal((await f.auth.session(login.token)).id,7);assert.deepEqual(f.erased,[]);
+ f.advance(900001);assert.equal((await f.auth.deleteAccount(deletionBody,login.token)).deleted,true);
+});
+test('permanent deletion erases credentials and revokes every session and verification proof',async()=>{
+ const f=deletionFixture();const original=f.user.email;
+ const first=await signed(f);f.advance(30001);const second=await signed(f);
+ f.states.get('account:7').challenge={id:'pending-proof',purpose:'forgot_password'};
+ const result=await f.auth.deleteAccount(deletionBody,first.token);
+ assert.equal(result.deleted,true);assert.equal(f.user.password,'');assert.notEqual(f.user.email,original);
+ assert.deepEqual(Object.keys(f.states.get('account:7')),['deletedAt']);
+ await assert.rejects(f.auth.session(first.token),e=>e.status===401);
+ await assert.rejects(f.auth.session(second.token),e=>e.status===401);
+ f.user.status='Available';await assert.rejects(f.auth.session(first.token),e=>e.status===401);
+ await assert.rejects(f.auth.login({email:original,password:'OldPassword1!'}),e=>e.status===401);
+ assert.deepEqual(f.erased,[7]);
+});
+test('deletion revalidates session under the transaction lock and does not succeed when persistence fails',async()=>{
+ const f=deletionFixture(), login=await signed(f);
+ const state=f.states.get('account:7');const oldTokens=state.tokens;state.tokens={};
+ await assert.rejects(f.auth.deleteAccount(deletionBody,login.token),e=>e.status===401);
+ assert.deepEqual(f.erased,[]);state.tokens=oldTokens;
+ const failing=createAuth({...f.deps,eraseAppAccess:async()=>{throw Error('database unavailable');}});
+ await assert.rejects(failing.deleteAccount(deletionBody,login.token),/database unavailable/);
+ assert.equal((await f.auth.session(login.token)).id,7);assert.equal(f.user.password,'hash:OldPassword1!');
 });

@@ -1,0 +1,69 @@
+ORAVISTA ACCOUNT DELETION - WEBSITE HANDOFF
+
+Implementation scope: mobile and shared backend. The website has not been changed. Verify the deployed backend and migration before enabling the website button. GitHub publication alone does not verify production availability.
+
+Message for Den
+
+Please add Settings > Delete Account on patient web. Show a warning that deletion is permanent, require the current OraVista password with a show/hide button, and provide Cancel and Permanently Delete Account buttons. Nothing should be submitted until the patient confirms. Disable repeat taps while the request is pending.
+
+Use the shared backend endpoint below. Do not delete the users row directly in Supabase: it also links the patient's clinical chart and could cascade-delete medical records. Do not compare passwords in frontend code.
+
+On success clear the website's saved authentication and cached profile, then replace the protected navigation stack with a public success/sign-in screen. Old web and mobile sessions will both be rejected by the server. Include a retained-clinic-records explanation and say existing appointments are not automatically cancelled.
+
+API CONTRACT
+
+DELETE <API_BASE_URL>/api/account
+Authorization: Bearer <current session token>
+Content-Type: application/json
+
+{
+  "accountId": <current signed-in patient ID>,
+  "password": "<current OraVista password>",
+  "confirmation": true
+}
+
+The bearer session establishes identity; accountId is only a guard against an account switch.
+
+Success (200):
+{
+  "deleted": true,
+  "cleanupPending": false,
+  "message": "Your OraVista account has been permanently deleted. Required clinic records are retained."
+}
+
+Only show success when deleted === true. cleanupPending can be true if removal of a stored avatar is still being retried; the account is already deleted. Do not resubmit DELETE to retry photo cleanup.
+
+Errors:
+- 400: missing password or confirmation. Show the form error.
+- 401 without code SESSION_EXPIRED: incorrect current password. Keep the patient signed in and allow another attempt.
+- 401 with code SESSION_EXPIRED: clear authentication and go to sign-in.
+- 403: this endpoint supports patient accounts only.
+- 409: account changed; reopen the deletion form for the current account.
+- 429: respect retryAfter seconds (also sent in Retry-After). Five wrong deletion passwords lock this operation for 15 minutes.
+- 500/503/network failure: do not claim deletion succeeded. Display the returned error or an honest retry message.
+
+DATA BEHAVIOR
+
+The transaction erases the login email/password, app phone/occupation/avatar reference, notifications, sessions and verification proofs. It replaces the login email with a non-deliverable unique tombstone and records account_deleted_at. The marker prevents future login even if someone changes status back to Available. This is irreversible removal of app credentials, not a recoverable account suspension.
+
+The same users row remains solely as the clinic chart identifier. Necessary patient identity and clinical fields, linked medical records, appointments, bills, payment history and retained audit history stay under clinic access controls. The deletion event does not create a fresh audit copy of the erased contact details. Existing historical audit data remains under the clinic's retention rules.
+
+Profile-photo cleanup is queued durably and retried by the backend. Only controlled profile-photo objects are eligible, and a photo still referenced by another patient is preserved. New uploads include the patient ID in their names. Replaced known photos are queued too. Legacy orphan objects without a reliable ownership link require a separate storage inventory; they must not be guessed or confused with medical files.
+
+Deleting app access does not cancel appointments, forgive bills or remove the clinical chart. If a patient later registers with the original email, that creates a new app account with a new ID; it does not automatically relink the retained chart.
+
+CLINIC-SIDE WEBSITE
+
+Display account_deleted_at as an app-account deletion indicator while keeping the retained chart accessible only to authorized clinic roles. Do not offer account reactivation or overwrite the deletion marker. Keep clinical/financial history governed by the clinic's approved retention and disposal policy.
+
+DEPLOYMENT
+
+The server applies migrations/20261128_account_deletion.sql after the existing authentication and audit initialization. It adds the deletion marker and cleanup outbox and redacts the deletion audit event. Startup must have migration privileges. The migration is idempotent and does not delete production patients or clinical records.
+
+The clinic must confirm the actual category-specific retention periods, privacy notice, backup retention and disposal process before production release. No universal ten-year retention period or automatic clinical purge has been hardcoded.
+
+VALIDATION
+
+Run npm.cmd test in both server and mobile projects. Server tests include isolated PostgreSQL transactions proving rollback, record retention, audit redaction, session revocation, avatar replacement and failed-storage retry behavior. Mobile tests cover Android/iOS keyboard layout properties, Cancel, wrong passwords, duplicate taps, account switching and local cleanup retry. Android and iOS production bundle exports pass. A mocked browser walkthrough of the mobile source passes the confirmation and public success/sign-in navigation; this does not replace a final native-device release check.
+
+No real patient account was deleted during these tests. The local tests did not run a production migration. Publishing to GitHub is separate from verifying production deployment; check the deployed backend and a release build before enabling the feature for patients.

@@ -8,6 +8,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { profileAge, profileSex } = require('./profile-fields');
+const { createAccountDeletion } = require('./account-deletion');
 const { catalog: clinicCatalog, services: clinicServices, findService, bookingAmount } = require('./service-catalog');
 const { registerDiagnosticRecords } = require('./diagnosticRecords');
 require('dotenv').config();
@@ -161,8 +162,10 @@ const uploadRecord = multer({ storage: storage });
 const {createAuth,postgresStore,strong}=require('./auth');
 const {accessControl}=require('./access-control');
 const authStore=postgresStore(db);
+const accountDeletion=createAccountDeletion({db,supabase,storageUrl:process.env.SUPABASE_URL});
 const auth=createAuth({
  store:authStore,
+ eraseAppAccess:accountDeletion.eraseAppAccess,
  findUser:async(email,id,client)=> (await (client||db).query(email?'SELECT * FROM users WHERE LOWER(email)=$1':'SELECT * FROM users WHERE id=$1',[email||id])).rows[0],
  compare:(value,stored)=>typeof stored==='string' && /^\$2[aby]\$/.test(stored)?bcrypt.compare(String(value),stored):Promise.resolve(false),
  hash:value=>bcrypt.hash(value,12),
@@ -180,6 +183,22 @@ app.post('/api/forgot-password',authRoute(req=>auth.request({...req.body,action:
 app.post('/api/verify-otp',authRoute(req=>auth.verify(req.body)));
 app.put('/api/reset-password-by-email',authRoute(req=>auth.reset(req.body)));
 app.put('/api/update-password',authRoute(async req=>auth.reset(req.body,await sessionFor(req))));
+// This route validates the bearer session again inside the account transaction.
+// It never accepts an email/ID as authority to delete another patient's account.
+app.delete('/api/account', async (req,res) => {
+    try {
+        const result=await auth.deleteAccount(req.body,(req.get('authorization') || '').replace(/^Bearer /i,''));
+        let cleanupPending=true;
+        try {
+            await accountDeletion.processCleanup(result.accountId);
+            cleanupPending=await accountDeletion.cleanupPending(result.accountId);
+        } catch { console.warn('Account photo cleanup will be retried.'); }
+        res.set('Cache-Control','no-store').json({deleted:true,cleanupPending,message:'Your OraVista account has been permanently deleted. Required clinic records are retained.'});
+    } catch(error) {
+        if(error.retryAfter) res.set('Retry-After',String(error.retryAfter));
+        res.status(error.status || 500).json({message:error.status?error.message:'Unable to delete the account. Please try again.',...(error.code?{code:error.code}:{}),...(error.retryAfter?{retryAfter:error.retryAfter}:{})});
+    }
+});
 app.use(accessControl({auth,db}));
 oversight.registerRoutes();
 app.use(async (req, res, next) => {
@@ -399,7 +418,7 @@ app.put('/api/update-profile', async (req, res) => {
     });
     const assignments = fields.map((key, i) => `${columns[key]} = $${i + 1}`).join(', ');
     try {
-        const { rows } = await db.query(`UPDATE users SET ${assignments} WHERE id = $${values.length + 1} RETURNING *`, [...values, id]);
+        const { rows } = await db.query(`UPDATE users SET ${assignments} WHERE id = $${values.length + 1} AND account_deleted_at IS NULL RETURNING *`, [...values, id]);
         if (!rows.length) return res.status(404).json({ message: 'Patient profile not found.' });
         const user = { ...rows[0] };
         delete user.password;
@@ -420,7 +439,8 @@ app.post('/api/upload-profile-picture', upload.single('profileImage'), async (re
         return res.status(400).json({ message: "No image file provided." });
     }
 
-    const filename = 'profile_' + Date.now() + path.extname(req.file.originalname);
+    const extension=path.extname(req.file.originalname).match(/^\.[a-z0-9]{1,10}$/i)?.[0] || '.jpg';
+    const filename = `profile_${req.actor.id}_${crypto.randomBytes(12).toString('hex')}${extension}`;
     const imagePath = 'uploads/' + filename;
 
     try {
@@ -440,12 +460,20 @@ app.post('/api/upload-profile-picture', upload.single('profileImage'), async (re
             return res.status(500).json({ message: "Failed to upload image to storage." });
         }
 
-        await db.query('UPDATE users SET profile_picture = $1 WHERE id = $2', [imagePath, userId]);
+        const saved=await accountDeletion.saveProfile(userId,imagePath);
+        if(!saved) {
+            await accountDeletion.queueProfileCleanup(req.actor.id,filename);
+            await accountDeletion.processCleanup(req.actor.id);
+            return res.status(401).json({message:'Your session expired. Please sign in again.',code:'SESSION_EXPIRED'});
+        }
         res.status(200).json({
             message: "Profile picture updated successfully!",
             imagePath: imagePath
         });
     } catch (err) {
+        // A failed database write must not leave an unreferenced new upload.
+        try { await accountDeletion.queueProfileCleanup(req.actor.id,filename); }
+        catch { console.warn('Profile photo cleanup could not be queued.'); }
         console.error("Upload DB Error:", err);
         res.status(500).json({ message: "Failed to save picture path to database." });
     }
@@ -1668,6 +1696,7 @@ app.post('/api/save-diagnosis', async (req, res) => {
 // START SERVER
 // ---------------------------------------------------------
 const PORT = process.env.PORT || 5000;
-authStore.initialize().then(() => oversight.initialize()).then(() => app.listen(PORT, () => {
+authStore.initialize().then(() => oversight.initialize()).then(() => accountDeletion.initialize()).then(() => app.listen(PORT, () => {
+    accountDeletion.startCleanup();
     console.log(`OraVista Backend running on http://localhost:${PORT}`);
 })).catch(error => { console.error('Authentication or oversight storage initialization failed. Check database migration permissions.', error.message); process.exitCode=1; db.end(); });
